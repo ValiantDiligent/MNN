@@ -25,13 +25,45 @@ namespace mls {
 
 namespace {
 
-void restoreAndroidSteppingStatusIfNeeded(Llm* llm) {
+bool hasGenerationError(const MNN::Transformer::LlmContext* context) {
+    return context == nullptr ||
+           context->status == MNN::Transformer::LlmStatus::INTERNAL_ERROR ||
+           context->status == MNN::Transformer::LlmStatus::TIMEOUT ||
+           context->status == MNN::Transformer::LlmStatus::NOT_LOADED;
+}
+
+const MNN::Transformer::LlmContext* resetAndroidGenerationError(
+        Llm* llm, const MNN::Transformer::LlmContext* context) {
+    const auto status = context != nullptr ? context->status : MNN::Transformer::LlmStatus::INTERNAL_ERROR;
+    // Discard partial KV/history tokens and cached prompt, not the wrapper's conversation.
+    llm->reset();
+    auto* reset_context = const_cast<MNN::Transformer::LlmContext*>(llm->getContext());
+    if (reset_context != nullptr) {
+        // Keep this request's failure visible to JNI, even if reset() changes status in a runtime.
+        reset_context->status = status;
+    }
+    return context != nullptr ? reset_context : nullptr;
+}
+
+void restoreAndroidSteppingStatusIfNeeded(Llm* llm, bool recover_generation_error = false) {
     if (llm == nullptr) {
         return;
     }
     auto* context = llm->getContext();
     if (context == nullptr) {
         return;
+    }
+    if (recover_generation_error &&
+        (context->status == MNN::Transformer::LlmStatus::INTERNAL_ERROR ||
+         context->status == MNN::Transformer::LlmStatus::TIMEOUT)) {
+        // Only a new prompt after successful Load() may recover a failed generation.
+        // Never recover NOT_LOADED, or retry a failed step inside the decode loop.
+        llm->reset();
+        context = llm->getContext();
+        if (context == nullptr) {
+            return;
+        }
+        const_cast<MNN::Transformer::LlmContext*>(context)->status = MNN::Transformer::LlmStatus::RUNNING;
     }
     if (context->status == MNN::Transformer::LlmStatus::MAX_TOKENS_FINISHED ||
         context->status == MNN::Transformer::LlmStatus::NORMAL_FINISHED) {
@@ -242,13 +274,27 @@ LlmSession::~LlmSession() {
 
 const MNN::Transformer::LlmContext * LlmSession::Response(const std::string &prompt,
                                                           const std::function<bool(const std::string&, bool is_eop)>& on_progress) {
-    if (llm_ == nullptr) {
+    if (llm_ == nullptr || llm_->getContext() == nullptr) {
         return nullptr;
     }
 
+    const size_t history_size_before = history_.size();
+    std::vector<PromptItem> previous_history;
     if (!keep_history_) {
+        // Preserve the old conversation until this request succeeds, without copying it.
+        previous_history.swap(history_);
         history_.resize(1);
+        if (!previous_history.empty()) {
+            history_.front() = previous_history.front();
+        }
     }
+    auto rollback_history = [&]() {
+        if (!keep_history_) {
+            history_.swap(previous_history);
+        } else {
+            history_.resize(history_size_before);
+        }
+    };
     int current_size = 0;
     stop_requested_ = false;
     generate_text_end_ = false;
@@ -301,7 +347,7 @@ const MNN::Transformer::LlmContext * LlmSession::Response(const std::string &pro
     
     // Check for multimodal content in the full prompt
     auto multimodal_result = processMultimodalPrompt(full_prompt_text);
-    restoreAndroidSteppingStatusIfNeeded(llm_);
+    restoreAndroidSteppingStatusIfNeeded(llm_, model_loaded_);
     if (multimodal_result.has_multimodal) {
         MNN_DEBUG("Detected multimodal content, using multimodal API prompt %s with %zu images",
              multimodal_result.multimodal_prompt.prompt_template.c_str(),
@@ -316,14 +362,30 @@ const MNN::Transformer::LlmContext * LlmSession::Response(const std::string &pro
         MNN_DEBUG("No multimodal content detected, using regular text API");
         llm_->response(history_, &output_ostream, "<eop>", 0);
     }
+    auto* context = llm_->getContext();
+    if (hasGenerationError(context)) {
+        rollback_history();
+        return resetAndroidGenerationError(llm_, context);
+    }
     resolveAndroidSteppingEop(llm_, stream_state, current_size, max_new_tokens_);
     while (!stop_requested_ && !generate_text_end_ && current_size < max_new_tokens_) {
         llm_->generate(1);
         current_size++;
+        context = llm_->getContext();
+        if (hasGenerationError(context)) {
+            // Even with partial output or a pending <eop>, this is not a completed reply.
+            rollback_history();
+            return resetAndroidGenerationError(llm_, context);
+        }
         resolveAndroidSteppingEop(llm_, stream_state, current_size, max_new_tokens_);
     }
     if (!stop_requested_ && enable_audio_output_) {
         llm_->generateWavform();
+        context = llm_->getContext();
+        if (hasGenerationError(context)) {
+            rollback_history();
+            return resetAndroidGenerationError(llm_, context);
+        }
     }
     // Two post-decode outcomes:
     // 1. Natural <eop>: finalizePendingEop fires the on_response_complete
@@ -356,7 +418,6 @@ const MNN::Transformer::LlmContext * LlmSession::Response(const std::string &pro
         llm_->syncPromptCache(history_);
     }
 
-    auto context = llm_->getContext();
     float prefill_s = context->prefill_us / 1e6f;
     float decode_s = context->decode_us / 1e6f;
     float prefill_tps = (prefill_s > 0) ? context->prompt_len / prefill_s : 0;
@@ -449,7 +510,7 @@ void LlmSession::enableAudioOutput(bool enable) {
 const MNN::Transformer::LlmContext * LlmSession::ResponseWithHistory(
         const std::vector<PromptItem>& full_history,
         const std::function<bool(const std::string&, bool is_eop)>& on_progress) {
-    if (llm_ == nullptr) {
+    if (llm_ == nullptr || llm_->getContext() == nullptr) {
         return nullptr;
     }
 
@@ -505,7 +566,7 @@ const MNN::Transformer::LlmContext * LlmSession::ResponseWithHistory(
     
     // Check for multimodal content in the full prompt
     auto multimodal_result = processMultimodalPrompt(full_prompt_text);
-    restoreAndroidSteppingStatusIfNeeded(llm_);
+    restoreAndroidSteppingStatusIfNeeded(llm_, model_loaded_);
     if (multimodal_result.has_multimodal) {
         MNN_DEBUG("ResponseWithHistory: Detected multimodal content, using multimodal API");
         if (!multimodal_result.error_message.empty()) {
@@ -516,17 +577,29 @@ const MNN::Transformer::LlmContext * LlmSession::ResponseWithHistory(
         MNN_DEBUG("ResponseWithHistory: No multimodal content detected, using regular text API");
         llm_->response(temp_history, &output_ostream, "<eop>", 0);
     }
+    auto* context = llm_->getContext();
+    if (hasGenerationError(context)) {
+        return resetAndroidGenerationError(llm_, context);
+    }
     size_t kv_before_decode = llm_->getCurrentHistory();
     resolveAndroidSteppingEop(llm_, stream_state, current_size, max_new_tokens_);
 
     while (!stop_requested_ && !generate_text_end_ && current_size < max_new_tokens_) {
         llm_->generate(1);
         current_size++;
+        context = llm_->getContext();
+        if (hasGenerationError(context)) {
+            return resetAndroidGenerationError(llm_, context);
+        }
         resolveAndroidSteppingEop(llm_, stream_state, current_size, max_new_tokens_);
     }
 
     if (!stop_requested_ && enable_audio_output_) {
         llm_->generateWavform();
+        context = llm_->getContext();
+        if (hasGenerationError(context)) {
+            return resetAndroidGenerationError(llm_, context);
+        }
     }
 
     // Sync prompt cache if generation completed normally: either by <eop>

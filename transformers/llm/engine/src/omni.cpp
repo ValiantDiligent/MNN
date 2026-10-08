@@ -590,14 +590,66 @@ bool Omni::initProcessorRuntime() {
     return true;
 }
 
+std::vector<int> Omni::visionError(const char* message) {
+    MNN_ERROR("[Omni vision] %s\n", message);
+    mContext->status = LlmStatus::INTERNAL_ERROR;
+    // Embeddings and positions belong to the current request, not just its last image.
+    mVisionEmbeddings.clear();
+    mDeepStackEmbeddings.clear();
+    mAudioEmbeddings.clear();
+    mPositionIds.clear();
+    mVisionNum = 0;
+    mVisionSizeOverridden = false;
+    return {};
+}
+
 #ifdef LLM_SUPPORT_VISION
+static bool validVisionTensor(VARP value, const std::vector<int>& shape, halide_type_t type) {
+    auto info = value.get() ? value->getInfo() : nullptr;
+    if (!info || info->dim != shape || info->type != type || info->size <= 0 || info->order == NC4HW4) {
+        return false;
+    }
+    int64_t size = 1;
+    for (int dim : shape) {
+        if (dim <= 0 || size > std::numeric_limits<int>::max() / type.bytes() / dim) {
+            return false;
+        }
+        size *= dim;
+    }
+    return size == info->size;
+}
+
+static bool readableVisionImage(VARP image, bool allowAlpha = false) {
+    auto info = image.get() ? image->getInfo() : nullptr;
+    return info && info->dim.size() == 3 && info->order == NHWC &&
+           (info->dim[2] == 3 || (allowAlpha && info->dim[2] == 4)) &&
+           validVisionTensor(image, info->dim, halide_type_of<uint8_t>()) && image->readMap<uint8_t>();
+}
+
 std::vector<int> Omni::defaultVisionProcess(VARP image) {
     MNN::Express::ExecutorScope s(mExecutor);
-    mVisionHeight = UP_DIV(mVisionHeight, mVisionSizeUnit) * mVisionSizeUnit;
-    mVisionWidth  = UP_DIV(mVisionWidth, mVisionSizeUnit) * mVisionSizeUnit;
+    if (!mVisionModule || !readableVisionImage(image) || mVisionHeight <= 0 || mVisionWidth <= 0 ||
+        mVisionSizeUnit <= 0 || mVisionMaxSize < mVisionSizeUnit) {
+        return visionError("invalid default vision input or size configuration");
+    }
+    // Clamp BEFORE aligning: UP_DIV on an untrusted prompt dimension can overflow.
+    const int maxSize = mVisionMaxSize / mVisionSizeUnit * mVisionSizeUnit;
+    auto align = [this, maxSize](int size) {
+        size = std::min(size, maxSize);
+        return (size / mVisionSizeUnit + (size % mVisionSizeUnit != 0)) * mVisionSizeUnit;
+    };
+    mVisionHeight = align(mVisionHeight);
+    mVisionWidth = align(mVisionWidth);
+    if (static_cast<int64_t>(mVisionHeight) * mVisionWidth > std::numeric_limits<int>::max() / 3 / sizeof(float)) {
+        return visionError("default vision resize is too large");
+    }
     image = MNN::CV::resize(image, {mVisionWidth, mVisionHeight}, 0, 0,
                             MNN::CV::INTER_LINEAR, MNN::CV::COLOR_BGR2RGB,
                             mVisionMean, mVisionNorm);
+    if (!validVisionTensor(image, {mVisionHeight, mVisionWidth, 3}, halide_type_of<float>()) ||
+        !image->readMap<float>()) {
+        return visionError("cannot map resized image");
+    }
     image = Express::_Unsqueeze(image, {0});
     auto visionInputOrder = NCHW;
     auto visionInfo = mVisionModule->getInfo();
@@ -605,15 +657,27 @@ std::vector<int> Omni::defaultVisionProcess(VARP image) {
         visionInputOrder = visionInfo->inputs[0].order;
     }
     image = Express::_Convert(image, visionInputOrder);
-    auto imageEmbedding = mVisionModule->forward(image);
-
-    mVisionEmbeddings.push_back(imageEmbedding);
-    int visionLen = imageEmbedding->getInfo()->dim[0];
+    if (!image.get() || !image->getInfo() || !image->readMap<float>()) {
+        return visionError("cannot map vision input");
+    }
+    auto outputs = mVisionModule->onForward({image});
+    if (outputs.empty() || !outputs[0].get()) {
+        return visionError("vision encoder returned no output");
+    }
+    auto imageEmbedding = outputs[0];
+    auto info = imageEmbedding->getInfo();
+    if (!info || info->dim.size() != 3 ||
+        !validVisionTensor(imageEmbedding, {info->dim[0], 1, mConfig->hidden_size()}, halide_type_of<float>()) ||
+        !imageEmbedding->readMap<float>()) {
+        return visionError("invalid or unreadable vision embedding");
+    }
+    int visionLen = info->dim[0];
     std::vector<int> imgIds(visionLen, mVisionPad);
     if (mVisionStart >= 0 && mVisionEnd >= 0) {
         imgIds.insert(imgIds.begin(), mVisionStart);
         imgIds.push_back(mVisionEnd);
     }
+    mVisionEmbeddings.push_back(imageEmbedding);
     return imgIds;
 }
 
@@ -624,13 +688,20 @@ std::vector<int> Omni::gemma4VisionProcess(VARP image) {
     int max_soft_tokens = 280;
     int max_patches = max_soft_tokens * pooling_kernel_size * pooling_kernel_size; // 2520
     int patch_pixels = 3 * patch_size * patch_size; // 768
+    if (!mVisionModule || !readableVisionImage(image) || mVisionHeight <= 0 || mVisionWidth <= 0) {
+        return visionError("invalid Gemma4 image or dimensions");
+    }
 
-    // 1. Resize preserving aspect ratio, aligned to patch_size * pooling_kernel_size
+    // 1. Align to pooling cells. No final side can exceed 280 cells; clamp first
+    // to bound both multiplication and the longest-side reduction loop. Preserve
+    // round-to-nearest and the height-first tie break (800x800 -> 768x816).
     int align_size = patch_size * pooling_kernel_size; // 48
-    mVisionHeight = round(mVisionHeight / (float)align_size) * align_size;
-    mVisionWidth  = round(mVisionWidth / (float)align_size) * align_size;
-    if (mVisionHeight < align_size) mVisionHeight = align_size;
-    if (mVisionWidth < align_size) mVisionWidth = align_size;
+    auto align = [align_size, max_soft_tokens](int size) {
+        size = std::min(size, max_soft_tokens * align_size);
+        return std::max(1, (size + align_size / 2) / align_size) * align_size;
+    };
+    mVisionHeight = align(mVisionHeight);
+    mVisionWidth = align(mVisionWidth);
     // Ensure total patches <= max_patches
     int total_patches = (mVisionHeight / patch_size) * (mVisionWidth / patch_size);
     while (total_patches > max_patches) {
@@ -648,14 +719,20 @@ std::vector<int> Omni::gemma4VisionProcess(VARP image) {
     image = MNN::CV::resize(image, {mVisionWidth, mVisionHeight}, 0, 0,
                             MNN::CV::INTER_LINEAR, MNN::CV::COLOR_BGR2RGB,
                             mean, norm);
-    // 3. Patchify: CV::resize outputs [H, W, 3] but readMap returns NC4HW4 packed data (stride=4)
+    if (!validVisionTensor(image, {mVisionHeight, mVisionWidth, 3}, halide_type_of<float>())) {
+        return visionError("invalid resized Gemma4 image");
+    }
+    // 3. Patchify the NHWC [H, W, 3] image (stride=3).
     int grid_h = mVisionHeight / patch_size;
     int grid_w = mVisionWidth / patch_size;
     int num_patches = grid_h * grid_w;
     {
         auto srcPtr = image->readMap<float>();
         auto patches = _Input({num_patches, patch_pixels}, NCHW);
-        auto dstPtr = patches->writeMap<float>();
+        auto dstPtr = patches.get() ? patches->writeMap<float>() : nullptr;
+        if (!srcPtr || !dstPtr) {
+            return visionError("cannot map Gemma4 patches");
+        }
         int W = mVisionWidth;
         // CV::resize output is NHWC [H,W,3], stride=3
         for (int ph = 0; ph < grid_h; ph++) {
@@ -680,7 +757,10 @@ std::vector<int> Omni::gemma4VisionProcess(VARP image) {
 
     // 4. Generate position_ids: [num_patches, 2] as (x, y)
     auto posIds = _Input({num_patches, 2}, NCHW, halide_type_of<int>());
-    auto posPtr = posIds->writeMap<int>();
+    auto posPtr = posIds.get() ? posIds->writeMap<int>() : nullptr;
+    if (!posPtr) {
+        return visionError("cannot map Gemma4 position ids");
+    }
     for (int h = 0; h < grid_h; h++) {
         for (int w = 0; w < grid_w; w++) {
             int idx = h * grid_w + w;
@@ -693,11 +773,18 @@ std::vector<int> Omni::gemma4VisionProcess(VARP image) {
     if (num_patches < max_patches) {
         int pad_len = max_patches - num_patches;
         auto pad_patches = Express::_Input({pad_len, patch_pixels}, NCHW);
-        ::memset(pad_patches->writeMap<float>(), 0, pad_len * patch_pixels * sizeof(float));
+        auto padPtr = pad_patches.get() ? pad_patches->writeMap<float>() : nullptr;
+        if (!padPtr) {
+            return visionError("cannot map Gemma4 patch padding");
+        }
+        ::memset(padPtr, 0, pad_len * patch_pixels * sizeof(float));
         image = Express::_Concat({image, pad_patches}, 0);
 
         auto pad_pos = Express::_Input({pad_len, 2}, NCHW, halide_type_of<int>());
-        auto padPosPtr = pad_pos->writeMap<int>();
+        auto padPosPtr = pad_pos.get() ? pad_pos->writeMap<int>() : nullptr;
+        if (!padPosPtr) {
+            return visionError("cannot map Gemma4 position padding");
+        }
         for (int i = 0; i < pad_len * 2; i++) padPosPtr[i] = -1;
         posIds = Express::_Concat({posIds, pad_pos}, 0);
     }
@@ -705,9 +792,18 @@ std::vector<int> Omni::gemma4VisionProcess(VARP image) {
     // 6. Add batch dimension: [1, max_patches, ...]
     image = Express::_Unsqueeze(image, {0});
     posIds = Express::_Unsqueeze(posIds, {0});
+    if (!validVisionTensor(image, {1, max_patches, patch_pixels}, halide_type_of<float>()) ||
+        !validVisionTensor(posIds, {1, max_patches, 2}, halide_type_of<int>()) ||
+        !image->readMap<float>() || !posIds->readMap<int>()) {
+        return visionError("cannot map padded Gemma4 inputs");
+    }
 
-    // Run vision model (outputs fixed max_soft_tokens)
+    // Run vision model (outputs fixed max_soft_tokens).
     auto outputs = mVisionModule->onForward({image, posIds});
+    if (outputs.empty() || !validVisionTensor(outputs[0], {1, max_soft_tokens, mConfig->hidden_size()},
+                                             halide_type_of<float>()) || !outputs[0]->readMap<float>()) {
+        return visionError("invalid or unreadable Gemma4 encoder output");
+    }
     auto imageEmbedding = outputs[0];
 
     // Squeeze batch dim: [1, max_soft_tokens, hidden] -> [max_soft_tokens, hidden]
@@ -718,13 +814,22 @@ std::vector<int> Omni::gemma4VisionProcess(VARP image) {
     // Transpose for MNN format: [seq, hidden] -> [seq, 1, hidden]
     imageEmbedding = Express::_Unsqueeze(imageEmbedding, {1});
 
-    // Only use actual (non-padding) soft tokens, not the full 280
+    // Only use actual (non-padding) soft tokens, not the full 280.
     int actual_soft_tokens = num_patches / (pooling_kernel_size * pooling_kernel_size);
-    if (actual_soft_tokens < imageEmbedding->getInfo()->dim[0]) {
-        // Slice to [actual_soft_tokens, 1, hidden]
+    if (!validVisionTensor(imageEmbedding, {max_soft_tokens, 1, mConfig->hidden_size()}, halide_type_of<float>())) {
+        return visionError("invalid Gemma4 embedding shape");
+    }
+    auto src = imageEmbedding->readMap<float>();
+    if (!src) {
+        return visionError("cannot map Gemma4 embedding");
+    }
+    if (actual_soft_tokens < max_soft_tokens) {
         auto sliced = _Input({actual_soft_tokens, 1, mConfig->hidden_size()}, NCHW);
-        auto src = imageEmbedding->readMap<float>();
-        ::memcpy(sliced->writeMap<float>(), src, actual_soft_tokens * mConfig->hidden_size() * sizeof(float));
+        auto dst = sliced.get() ? sliced->writeMap<float>() : nullptr;
+        if (!dst) {
+            return visionError("cannot map sliced Gemma4 embedding");
+        }
+        ::memcpy(dst, src, static_cast<size_t>(actual_soft_tokens) * mConfig->hidden_size() * sizeof(float));
         imageEmbedding = sliced;
     }
     mVisionEmbeddings.push_back(imageEmbedding);
@@ -1551,7 +1656,7 @@ std::vector<int> Omni::visionProcess(const std::string& file) {
     VARP image = MNN::CV::imread(file);
     return visionProcess(image);
 #else
-    return std::vector<int>(0);
+    return visionError("image decoding support is not built");
 #endif
 }
 
@@ -1660,14 +1765,15 @@ std::vector<int> Omni::videoProcess(const std::string& file) {
 
 std::vector<int> Omni::visionProcess(VARP image) {
 #ifdef LLM_SUPPORT_VISION
-    if (image == nullptr) {
-        MNN_PRINT("Omni Can't open image\n");
-        mVisionSizeOverridden = false;
-        return std::vector<int>(0);
+    MNN::Express::ExecutorScope s(mExecutor);
+    auto info = mVisionModule ? mVisionModule->getInfo() : nullptr;
+    if (!info || info->inputNames.empty() || info->inputs.size() != info->inputNames.size() ||
+        !readableVisionImage(image, true)) {
+        return visionError("missing vision module metadata or invalid image input");
     }
     Timer _t;
     std::vector<int> imgIds;
-    const auto inputNames = mVisionModule->getInfo()->inputNames;
+    const auto& inputNames = info->inputNames;
     const auto visionType = mConfig->config_.value("vision_type", "");
     if (inputNames.size() >= 3 && inputNames[0] == "patches") {
         imgIds = qwen2VisionProcess(image);
@@ -1683,15 +1789,26 @@ std::vector<int> Omni::visionProcess(VARP image) {
         } else {
             imgIds = minicpmVisionProcess(image);
         }
-    } else if (inputNames.size() >= 2 && inputNames[0] == "input_patches") {
+    } else if (inputNames[0] == "input_patches") {
+        if (inputNames.size() != 2) {
+            return visionError("Gemma4 vision expects two inputs");
+        }
         imgIds = gemma4VisionProcess(image);
     } else {
+        if (inputNames.size() != 1) {
+            return visionError("default vision expects one input");
+        }
         imgIds = defaultVisionProcess(image);
+    }
+    if (imgIds.empty() || mContext->status == LlmStatus::INTERNAL_ERROR) {
+        return visionError("image preprocessing or encoder failed");
     }
     bool async = mConfig->config_.value("async", true);
     if (!async) {
         for (auto& embd : mVisionEmbeddings) {
-            embd->readMap<float>();
+            if (!embd.get() || !embd->getInfo() || !embd->readMap<float>()) {
+                return visionError("cannot map vision embedding");
+            }
         }
     }
     mContext->vision_us += _t.durationInUs();
@@ -1701,7 +1818,7 @@ std::vector<int> Omni::visionProcess(VARP image) {
     mVisionNum += 1;
     return imgIds;
 #else
-    return std::vector<int>(0);
+    return visionError("vision support is not built");
 #endif
 }
 
@@ -1849,11 +1966,13 @@ std::vector<int> Omni::multimodeProcess(const std::string& mode, std::string inf
             std::stringstream hw_ss(match.str(1));
             char comma;
             int parsedHeight = 0, parsedWidth = 0;
-            if (hw_ss >> parsedHeight >> comma >> parsedWidth && parsedHeight > 0 && parsedWidth > 0) {
-                mVisionHeight = parsedHeight;
-                mVisionWidth = parsedWidth;
-                mVisionSizeOverridden = true;
+            if (!(hw_ss >> parsedHeight >> comma >> parsedWidth) || comma != ',' ||
+                parsedHeight <= 0 || parsedWidth <= 0) {
+                return visionError("invalid image <hw> dimensions");
             }
+            mVisionHeight = parsedHeight;
+            mVisionWidth = parsedWidth;
+            mVisionSizeOverridden = true;
             currentPosition = matchPosition + match.length();
         }
         if (currentPosition < info.length()) {
@@ -1949,6 +2068,14 @@ void Omni::addPositionIds(int t, int h, int w) {
 }
 
 std::vector<int> Omni::tokenizer_encode(const MultimodalPrompt& multimodal_input) {
+    MNN::Express::ExecutorScope s(mExecutor);
+    // Tokenization starts a new request. Discard inconsistent inference state
+    // before recovery, but keep this request's failure until its caller observes it.
+    if (mContext->status == LlmStatus::INTERNAL_ERROR) {
+        Llm::reset();
+        mContext->status = LlmStatus::RUNNING;
+    }
+    CHECK_LLM_RUNNING_RET(mContext, std::vector<int>());
     std::string prompt = multimodal_input.prompt_template;
     std::regex multimode_regex(kOmniMultimodalRegex);
     std::string::const_iterator searchStart(prompt.cbegin());
@@ -1972,6 +2099,9 @@ std::vector<int> Omni::tokenizer_encode(const MultimodalPrompt& multimodal_input
         std::vector<int> mul_ids;
         if (mode == "img") {
             mul_ids = processImageContent(content, multimodal_input.images);
+            if (mul_ids.empty() || mContext->status == LlmStatus::INTERNAL_ERROR) {
+                return visionError("failed to encode image prompt");
+            }
         } else if (mode == "audio") {
             mul_ids = processAudioContent(content, multimodal_input.audios);
         } else if (mode == "video") {
@@ -2010,6 +2140,10 @@ std::vector<int> Omni::tokenizer_encode(const std::string& prompt) {
 std::vector<int> Omni::processImageContent(const std::string& content, const std::map<std::string, PromptImagePart>& images) {
     auto it = images.find(content);
     if (it != images.end()) {
+        if (it->second.height < 0 || it->second.width < 0 ||
+            ((it->second.height == 0) != (it->second.width == 0))) {
+            return visionError("invalid image part dimensions");
+        }
         if (it->second.height > 0 && it->second.width > 0) {
             mVisionHeight = it->second.height;
             mVisionWidth = it->second.width;
@@ -2500,6 +2634,13 @@ void Omni::responseInterleaved(const std::vector<int>& input_ids, std::ostream* 
 }
 
 void Omni::response(const std::vector<int>& input_ids, std::ostream* os, const char* end_with, int max_new_tokens) {
+    // Unlike a new text/multimodal request, these ids are the result of the
+    // current tokenization. Never let generate_init erase its vision error.
+    CHECK_LLM_RUNNING(mContext);
+    if (input_ids.empty()) {
+        visionError("empty input ids");
+        return;
+    }
     MNN::Express::ExecutorScope s(mExecutor);
     if (!end_with) { end_with = "\n"; }
     generate_init(os, end_with);

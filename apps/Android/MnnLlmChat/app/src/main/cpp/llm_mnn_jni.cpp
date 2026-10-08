@@ -25,6 +25,80 @@ JavaVM* g_jvm = nullptr;
 constexpr const char* kCrashReportContextClass = "com/alibaba/mnnllm/android/utils/CrashReportContext";
 constexpr const char* kReportMethodName = "reportLlmSetConfig";
 constexpr const char* kReportMethodSignature = "(Ljava/lang/String;Ljava/lang/String;)V";
+
+jobject createSubmitResult(JNIEnv* env, const MNN::Transformer::LlmContext* context,
+                           const char* error_message = nullptr) {
+    if (error_message == nullptr) {
+        if (context == nullptr) {
+            error_message = "Chat is not ready. Please reload the model and try again.";
+        } else {
+            switch (context->status) {
+                case MNN::Transformer::LlmStatus::INTERNAL_ERROR:
+                    error_message = "Generation failed. Try a smaller image or text-only input, close other apps "
+                                    "to free memory, or switch to the CPU backend.";
+                    break;
+                case MNN::Transformer::LlmStatus::TIMEOUT:
+                    error_message = "Generation timed out. Try a shorter prompt or smaller image, close other apps "
+                                    "to free memory, or switch to the CPU backend.";
+                    break;
+                case MNN::Transformer::LlmStatus::NOT_LOADED:
+                    error_message = "The model is not loaded. Please reload it. If it still fails, close other apps "
+                                    "to free memory or switch to the CPU backend.";
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+    // All boxed values, keys and class references are local to this result.
+    if (env->PushLocalFrame(32) < 0) {
+        return nullptr;
+    }
+    jclass hashMapClass = env->FindClass("java/util/HashMap");
+    if (hashMapClass == nullptr) {
+        return env->PopLocalFrame(nullptr);
+    }
+    jmethodID hashMapInit = env->GetMethodID(hashMapClass, "<init>", "()V");
+    jmethodID putMethod = env->GetMethodID(hashMapClass, "put",
+                                          "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
+    if (env->ExceptionCheck()) {
+        return env->PopLocalFrame(nullptr);
+    }
+    jobject result = env->NewObject(hashMapClass, hashMapInit);
+    if (result == nullptr) {
+        return env->PopLocalFrame(nullptr);
+    }
+    if (error_message != nullptr) {
+        jclass booleanClass = env->FindClass("java/lang/Boolean");
+        if (booleanClass == nullptr) {
+            return env->PopLocalFrame(nullptr);
+        }
+        jmethodID booleanInit = env->GetMethodID(booleanClass, "<init>", "(Z)V");
+        if (booleanInit == nullptr) {
+            return env->PopLocalFrame(nullptr);
+        }
+        env->CallObjectMethod(result, putMethod, env->NewStringUTF("error"),
+                              env->NewObject(booleanClass, booleanInit, JNI_TRUE));
+        env->CallObjectMethod(result, putMethod, env->NewStringUTF("message"), env->NewStringUTF(error_message));
+    } else {
+        jclass longClass = env->FindClass("java/lang/Long");
+        if (longClass == nullptr) {
+            return env->PopLocalFrame(nullptr);
+        }
+        jmethodID longInit = env->GetMethodID(longClass, "<init>", "(J)V");
+        if (longInit == nullptr) {
+            return env->PopLocalFrame(nullptr);
+        }
+        const char* keys[] = {"prompt_len", "decode_len", "vision_time", "audio_time", "prefill_time", "decode_time"};
+        const jlong values[] = {context->prompt_len, context->gen_seq_len, context->vision_us,
+                                context->audio_us, context->prefill_us, context->decode_us};
+        for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+            env->CallObjectMethod(result, putMethod, env->NewStringUTF(keys[i]),
+                                  env->NewObject(longClass, longInit, values[i]));
+        }
+    }
+    return env->PopLocalFrame(result);
+}
 }
 
 void ReportLlmSetConfigToFirebase(const std::string& stage, const std::string& config_json) {
@@ -150,24 +224,24 @@ JNIEXPORT jobject JNICALL Java_com_alibaba_mnnllm_android_llm_LlmSession_submitN
                                                                                       progressListener) {
     auto *llm = reinterpret_cast<mls::LlmSession *>(llmPtr);
     if (!llm) {
-        // Return a HashMap with error info to match the Java signature
-        jclass hashMapClass = env->FindClass("java/util/HashMap");
-        jmethodID hashMapInit = env->GetMethodID(hashMapClass, "<init>", "()V");
-        jmethodID putMethod = env->GetMethodID(hashMapClass, "put",
-                                               "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
-        jobject hashMap = env->NewObject(hashMapClass, hashMapInit);
-        env->CallObjectMethod(hashMap, putMethod, env->NewStringUTF("error"),
-                              env->NewStringUTF("Failed, Chat is not ready!"));
-        return hashMap;
+        return createSubmitResult(env, nullptr);
+    }
+    if (inputStr == nullptr) {
+        return createSubmitResult(env, nullptr, "The prompt is missing. Please enter a message and try again.");
     }
     const char *input_str = env->GetStringUTFChars(inputStr, nullptr);
-    jclass progressListenerClass = env->GetObjectClass(progressListener);
-    jmethodID onProgressMethod = env->GetMethodID(progressListenerClass, "onProgress",
-                                                  "(Ljava/lang/String;)Z");
+    if (input_str == nullptr) {
+        return nullptr; // Preserve the pending JNI allocation exception.
+    }
+    std::string prompt(input_str);
+    env->ReleaseStringUTFChars(inputStr, input_str);
+    jclass progressListenerClass = progressListener ? env->GetObjectClass(progressListener) : nullptr;
+    jmethodID onProgressMethod = progressListenerClass ? env->GetMethodID(progressListenerClass, "onProgress",
+                                                  "(Ljava/lang/String;)Z") : nullptr;
     if (!onProgressMethod) {
         MNN_DEBUG("ProgressListener onProgress method not found.");
     }
-    auto *context = llm->Response(input_str, [&, progressListener, onProgressMethod](
+    auto *context = llm->Response(prompt, [&, progressListener, onProgressMethod](
             const std::string &response, bool is_eop) {
         if (progressListener && onProgressMethod) {
             jstring javaString = is_eop ? nullptr : env->NewStringUTF(response.c_str());
@@ -179,50 +253,8 @@ JNIEXPORT jobject JNICALL Java_com_alibaba_mnnllm_android_llm_LlmSession_submitN
             return true;
         }
     });
-    int64_t prompt_len = 0;
-    int64_t decode_len = 0;
-    int64_t vision_time = 0;
-    int64_t audio_time = 0;
-    int64_t prefill_time = 0;
-    int64_t decode_time = 0;
-    prompt_len += context->prompt_len;
-    decode_len += context->gen_seq_len;
-    vision_time += context->vision_us;
-    audio_time += context->audio_us;
-    prefill_time += context->prefill_us;
-    decode_time += context->decode_us;
-    jclass hashMapClass = env->FindClass("java/util/HashMap");
-    jmethodID hashMapInit = env->GetMethodID(hashMapClass, "<init>", "()V");
-    jmethodID putMethod = env->GetMethodID(hashMapClass, "put",
-                                           "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
-    jobject hashMap = env->NewObject(hashMapClass, hashMapInit);
-
-    // Add metrics to the HashMap
-    env->CallObjectMethod(hashMap, putMethod, env->NewStringUTF("prompt_len"),
-                          env->NewObject(env->FindClass("java/lang/Long"),
-                                         env->GetMethodID(env->FindClass("java/lang/Long"),
-                                                          "<init>", "(J)V"), prompt_len));
-    env->CallObjectMethod(hashMap, putMethod, env->NewStringUTF("decode_len"),
-                          env->NewObject(env->FindClass("java/lang/Long"),
-                                         env->GetMethodID(env->FindClass("java/lang/Long"),
-                                                          "<init>", "(J)V"), decode_len));
-    env->CallObjectMethod(hashMap, putMethod, env->NewStringUTF("vision_time"),
-                          env->NewObject(env->FindClass("java/lang/Long"),
-                                         env->GetMethodID(env->FindClass("java/lang/Long"),
-                                                          "<init>", "(J)V"), vision_time));
-    env->CallObjectMethod(hashMap, putMethod, env->NewStringUTF("audio_time"),
-                          env->NewObject(env->FindClass("java/lang/Long"),
-                                         env->GetMethodID(env->FindClass("java/lang/Long"),
-                                                          "<init>", "(J)V"), audio_time));
-    env->CallObjectMethod(hashMap, putMethod, env->NewStringUTF("prefill_time"),
-                          env->NewObject(env->FindClass("java/lang/Long"),
-                                         env->GetMethodID(env->FindClass("java/lang/Long"),
-                                                          "<init>", "(J)V"), prefill_time));
-    env->CallObjectMethod(hashMap, putMethod, env->NewStringUTF("decode_time"),
-                          env->NewObject(env->FindClass("java/lang/Long"),
-                                         env->GetMethodID(env->FindClass("java/lang/Long"),
-                                                          "<init>", "(J)V"), decode_time));
-    return hashMap;
+    env->DeleteLocalRef(progressListenerClass);
+    return createSubmitResult(env, context);
 }
 
 
@@ -237,15 +269,10 @@ JNIEXPORT jobject JNICALL Java_com_alibaba_mnnllm_android_llm_LlmSession_submitF
 ) {
     auto *llm = reinterpret_cast<mls::LlmSession *>(llmPtr);
     if (!llm) {
-        // Return a HashMap with error info to match the Java signature
-        jclass hashMapClass = env->FindClass("java/util/HashMap");
-        jmethodID hashMapInit = env->GetMethodID(hashMapClass, "<init>", "()V");
-        jmethodID putMethod = env->GetMethodID(hashMapClass, "put",
-                                               "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
-        jobject hashMap = env->NewObject(hashMapClass, hashMapInit);
-        env->CallObjectMethod(hashMap, putMethod, env->NewStringUTF("error"),
-                              env->NewStringUTF("Failed, Chat is not ready!"));
-        return hashMap;
+        return createSubmitResult(env, nullptr);
+    }
+    if (historyList == nullptr) {
+        return createSubmitResult(env, nullptr, "Chat history is missing. Please reopen the chat and try again.");
     }
 
     // 解析 Java List<Pair<String, String>> 到 C++ vector
@@ -257,20 +284,14 @@ JNIEXPORT jobject JNICALL Java_com_alibaba_mnnllm_android_llm_LlmSession_submitF
     jmethodID getMethod = env->GetMethodID(listClass, "get", "(I)Ljava/lang/Object;");
 
     jint listSize = env->CallIntMethod(historyList, sizeMethod);
+    env->DeleteLocalRef(listClass);
 
     // 获取 Pair 类和相关方法，修改为 android.util.Pair
     jclass pairClass = env->FindClass("android/util/Pair");
     if (pairClass == nullptr) {
         MNN_DEBUG("Failed to find android.util.Pair class");
-        // Return a HashMap with error info to match the Java signature
-        jclass hashMapClass = env->FindClass("java/util/HashMap");
-        jmethodID hashMapInit = env->GetMethodID(hashMapClass, "<init>", "()V");
-        jmethodID putMethod = env->GetMethodID(hashMapClass, "put",
-                                               "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
-        jobject hashMap = env->NewObject(hashMapClass, hashMapInit);
-        env->CallObjectMethod(hashMap, putMethod, env->NewStringUTF("error"),
-                              env->NewStringUTF("Failed to find android.util.Pair class"));
-        return hashMap;
+        env->ExceptionClear();
+        return createSubmitResult(env, nullptr, "Unable to read chat history. Please restart the app and try again.");
     }
     // 使用 GetFieldID 访问 first 字段
     jfieldID firstField = env->GetFieldID(pairClass, "first", "Ljava/lang/Object;");
@@ -315,11 +336,12 @@ JNIEXPORT jobject JNICALL Java_com_alibaba_mnnllm_android_llm_LlmSession_submitF
             env->DeleteLocalRef(contentObj);
         }
     }
+    env->DeleteLocalRef(pairClass);
 
     // 设置进度回调
-    jclass progressListenerClass = env->GetObjectClass(progressListener);
-    jmethodID onProgressMethod = env->GetMethodID(progressListenerClass, "onProgress",
-                                                  "(Ljava/lang/String;)Z");
+    jclass progressListenerClass = progressListener ? env->GetObjectClass(progressListener) : nullptr;
+    jmethodID onProgressMethod = progressListenerClass ? env->GetMethodID(progressListenerClass, "onProgress",
+                                                  "(Ljava/lang/String;)Z") : nullptr;
 
     if (!onProgressMethod) {
         MNN_DEBUG("ProgressListener onProgress method not found.");
@@ -341,47 +363,8 @@ JNIEXPORT jobject JNICALL Java_com_alibaba_mnnllm_android_llm_LlmSession_submitF
         }
     });
 
-    // 构建返回结果
-    int64_t prompt_len = 0;
-    int64_t decode_len = 0;
-    int64_t vision_time = 0;
-    int64_t audio_time = 0;
-    int64_t prefill_time = 0;
-    int64_t decode_time = 0;
-
-    if (context) {
-        prompt_len += context->prompt_len;
-        decode_len += context->gen_seq_len;
-        vision_time += context->vision_us;
-        audio_time += context->audio_us;
-        prefill_time += context->prefill_us;
-        decode_time += context->decode_us;
-    }
-
-    jclass hashMapClass = env->FindClass("java/util/HashMap");
-    jmethodID hashMapInit = env->GetMethodID(hashMapClass, "<init>", "()V");
-    jmethodID hashMapPut = env->GetMethodID(hashMapClass, "put",
-                                            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
-    jobject hashMap = env->NewObject(hashMapClass, hashMapInit);
-
-    // 添加统计信息
-    jclass longClass = env->FindClass("java/lang/Long");
-    jmethodID longInit = env->GetMethodID(longClass, "<init>", "(J)V");
-
-    env->CallObjectMethod(hashMap, hashMapPut, env->NewStringUTF("prompt_len"),
-                          env->NewObject(longClass, longInit, prompt_len));
-    env->CallObjectMethod(hashMap, hashMapPut, env->NewStringUTF("decode_len"),
-                          env->NewObject(longClass, longInit, decode_len));
-    env->CallObjectMethod(hashMap, hashMapPut, env->NewStringUTF("vision_time"),
-                          env->NewObject(longClass, longInit, vision_time));
-    env->CallObjectMethod(hashMap, hashMapPut, env->NewStringUTF("audio_time"),
-                          env->NewObject(longClass, longInit, audio_time));
-    env->CallObjectMethod(hashMap, hashMapPut, env->NewStringUTF("prefill_time"),
-                          env->NewObject(longClass, longInit, prefill_time));
-    env->CallObjectMethod(hashMap, hashMapPut, env->NewStringUTF("decode_time"),
-                          env->NewObject(longClass, longInit, decode_time));
-
-    return hashMap;
+    env->DeleteLocalRef(progressListenerClass);
+    return createSubmitResult(env, context);
 }
 
 

@@ -213,6 +213,9 @@ public:
     std::vector<int> qwenVideoProcess(const std::vector<VARP>& frames, const std::vector<float>& timestamps);
 
 private:
+    friend class OmniVisionTest;
+    using Llm::mCachedPromptText; // Inspect recovery state through the internal test friend only.
+    std::vector<int> visionError(const char* message);
     bool initProcessorRuntime();
     int mVisionHeight = 448, mVisionWidth = 448, mVisionStart = 151857, mVisionEnd = 151858, mVisionPad = 151859,
         mAudioPad = 151646, mAudioStart = -1, mAudioEnd = -1, mVideoPad = -1;
