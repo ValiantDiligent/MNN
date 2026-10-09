@@ -104,9 +104,11 @@ class ChatService {
     }
 
     @Synchronized
-    fun removeSession(sessionId: String) {
-        transformerSessionMap.remove(sessionId)
-        diffusionSessionMap.remove(sessionId)
+    fun removeSession(session: ChatSession) {
+        // reset() changes sessionId; remove the original registration by identity, not by
+        // its mutable ID (which may now belong to another live session).
+        transformerSessionMap.entries.removeAll { it.value === session }
+        diffusionSessionMap.entries.removeAll { it.value === session }
     }
 
     companion object {

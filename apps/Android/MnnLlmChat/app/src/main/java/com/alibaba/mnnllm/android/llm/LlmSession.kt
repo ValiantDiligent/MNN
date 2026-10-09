@@ -12,8 +12,6 @@ import com.alibaba.mnnllm.android.modelsettings.ModelConfig.Companion.getExtraCo
 import com.google.gson.Gson
 import timber.log.Timber
 import java.io.File
-import java.util.stream.Collectors
-import kotlin.concurrent.Volatile
 import android.util.Pair
 import com.alibaba.mnnllm.android.utils.MmapUtils
 import android.content.Context
@@ -32,18 +30,9 @@ class LlmSession (
     private val useCustomConfig: Boolean = true
 ): ChatSession{
     override var supportOmni: Boolean = false
-    private var nativePtr: Long = 0
+    private val lifecycle = NativeSessionLifecycle(::releaseNative) { provide().removeSession(this) }
 
-    @Volatile
-    private var modelLoading = false
-
-    @Volatile
-    private var generating = false
-
-    @Volatile
-    private var releaseRequested = false
-
-    private var keepHistory = false
+    @Volatile private var keepHistory = false
 
     private var isQnn = false
 
@@ -55,76 +44,40 @@ class LlmSession (
     }
 
     override fun load() {
-        Log.d(TAG, "MNN_DEBUG load begin modelId: $modelId backend: $backendType")
-        modelLoading = true
-        isQnn = ModelTypeUtils.isQnnModel(modelId)
-
-        checkAndMergeSplitFiles()
-        var historyStringList: List<String>? = null
-        val currentHistory = this.savedHistory
-        if (!currentHistory.isNullOrEmpty()) {
-            historyStringList =
-                    currentHistory.stream()
-                            .map { obj: ChatDataItem -> obj.text }
-                    .filter { obj: String? -> obj != null }
-                    .map { obj: String? -> obj!! }
-                    .collect(Collectors.toList())
-        }
-        val config = if (useCustomConfig) {
-            ModelConfig.loadMergedConfig(configPath, getExtraConfigFile(modelId))!!
-        } else {
-            ModelConfig.loadDefaultConfig(configPath)!!
-        }
-        var rootCacheDir: String? = ""
-        if (config.useMmap == true) {
-            rootCacheDir = MmapUtils.getMmapDir(modelId)
-            File(rootCacheDir).mkdirs()
-        }
-        val configMap = HashMap<String, Any>().apply {
-            put("is_r1", ModelTypeUtils.isR1Model(modelId))
-            put("mmap_dir", rootCacheDir ?: "")
-            put("keep_history", keepHistory)
-        }
-        val llmConfig = if (useCustomConfig) {
-            ModelConfig.loadMergedConfig(configPath, getExtraConfigFile(modelId))!!
-        } else {
-            ModelConfig.loadDefaultConfig(configPath)!!
-        }
-        // Override backend type from constructor only if not null
-        if (backendType != null) {
-            llmConfig.backendType = backendType
-        }
-        if (isQnn) {
-            llmConfig.visualModel = "visual_qnn_${QnnModule.modelMiddleName()}.mnn"
-        }
-        Log.d(TAG, "MNN_DEBUG load initNative")
-        nativePtr = initNative(
-                configPath,
-                historyStringList,
-        if (llmConfig != null) {
-            Gson().toJson(llmConfig)
-        } else {
-            "{}"
-        },
-        Gson().toJson(configMap)
-        )
-        Log.d(TAG, "MNN_DEBUG load initNative end")
-        modelLoading = false
-        if (nativePtr == 0L) {
-            Log.e(TAG, "Model load failed - native initialization returned null pointer")
-            throw IllegalStateException("Model load failed - the model module could not be loaded")
-        }
-        if (releaseRequested) {
-            release()
+        lifecycle.load {
+            Log.d(TAG, "MNN_DEBUG load begin modelId: $modelId backend: $backendType")
+            isQnn = ModelTypeUtils.isQnnModel(modelId)
+            checkAndMergeSplitFiles()
+            val historyStringList = savedHistory?.takeIf { it.isNotEmpty() }?.mapNotNull { it.text }
+            val llmConfig = if (useCustomConfig) {
+                ModelConfig.loadMergedConfig(configPath, getExtraConfigFile(modelId))!!
+            } else {
+                ModelConfig.loadDefaultConfig(configPath)!!
+            }
+            var rootCacheDir: String? = ""
+            if (llmConfig.useMmap == true) {
+                rootCacheDir = MmapUtils.getMmapDir(modelId)
+                File(rootCacheDir).mkdirs()
+            }
+            val configMap = HashMap<String, Any>().apply {
+                put("is_r1", ModelTypeUtils.isR1Model(modelId))
+                put("mmap_dir", rootCacheDir ?: "")
+                put("keep_history", keepHistory)
+            }
+            if (backendType != null) {
+                llmConfig.backendType = backendType
+            }
+            if (isQnn) {
+                llmConfig.visualModel = "visual_qnn_${QnnModule.modelMiddleName()}.mnn"
+            }
+            initNative(configPath, historyStringList, Gson().toJson(llmConfig), Gson().toJson(configMap))
         }
     }
 
     /**
      * Check if the model is successfully loaded and ready for inference
      */
-    fun isModelLoaded(): Boolean {
-        return nativePtr != 0L
-    }
+    fun isModelLoaded(): Boolean = lifecycle.isLoaded()
     
     /**
      * Check and merge split files for the current model
@@ -175,53 +128,19 @@ class LlmSession (
                 return submitMockLatexHistory(progressListener)
             }
             Log.d(TAG, "MNN_DEBUG submit$prompt")
-            generating = true
-            val result = submitNative(nativePtr, prompt, keepHistory, progressListener)
-            generating = false
-            if (releaseRequested) {
-                release()
+            return lifecycle.generate { ptr ->
+                submitNative(ptr, prompt, keepHistory, progressListener)
             }
-            return result
         }
     }
 
     override fun reset(): String {
-        synchronized(this) {
-            resetNative(nativePtr)
-        }
+        lifecycle.mutate { ptr -> resetNative(ptr) }
         return generateNewSessionId()
     }
 
     override fun release() {
-        synchronized(this) {
-            Log.d(
-                    TAG,
-                    "MNN_DEBUG release nativePtr: $nativePtr mGenerating: $generating"
-            )
-            if (!generating && !modelLoading) {
-                releaseInner()
-            } else {
-                releaseRequested = true
-                while (generating || modelLoading) {
-                    try {
-                        (this as Object).wait()
-                    } catch (e: InterruptedException) {
-                        Thread.currentThread().interrupt()
-                        Log.e(TAG, "Thread interrupted while waiting for release", e)
-                    }
-                }
-                releaseInner()
-            }
-        }
-    }
-
-    private fun releaseInner() {
-        if (nativePtr != 0L) {
-            releaseNative(nativePtr)
-            nativePtr = 0
-            provide().removeSession(sessionId)
-            (this as Object).notifyAll()
-        }
+        lifecycle.release(waitForIdle = true)
     }
 
     private external fun initNative(
@@ -254,29 +173,23 @@ class LlmSession (
     }
 
     override fun setEnableAudioOutput(enable: Boolean) {
-        updateEnableAudioOutputNative(nativePtr, enable)
+        lifecycle.mutate { ptr -> updateEnableAudioOutputNative(ptr, enable) }
     }
 
+    // Busy native reads use the existing empty fallback instead of racing native string writes.
     override val debugInfo
-        get() = getDebugInfoNative(nativePtr) + "\n"
-
+        get() = lifecycle.withIdleHandle { ptr -> if (ptr != 0L) getDebugInfoNative(ptr) + "\n" else "" }
 
     fun setAudioDataListener(listener: AudioDataListener?) {
-        synchronized(this) {
-            if (nativePtr != 0L) {
-                setWavformCallbackNative(nativePtr, listener)
-            } else {
-                Log.e(TAG, "nativePtr null")
-            }
-        }
+        lifecycle.mutate { ptr -> setWavformCallbackNative(ptr, listener) }
     }
 
     fun updateMaxNewTokens(maxNewTokens: Int) {
-        updateMaxNewTokensNative(nativePtr, maxNewTokens)
+        lifecycle.mutate { ptr -> updateMaxNewTokensNative(ptr, maxNewTokens) }
     }
 
     fun updateSystemPrompt(systemPrompt: String) {
-        updateSystemPromptNative(nativePtr, systemPrompt)
+        lifecycle.mutate { ptr -> updateSystemPromptNative(ptr, systemPrompt) }
     }
 
     override fun updateThinking(thinking: Boolean) {
@@ -290,7 +203,7 @@ class LlmSession (
 
     fun updateConfig(configJson: String) {
         Log.d(TAG, "updateConfig: $configJson")
-        updateConfigNative(nativePtr, configJson)
+        lifecycle.mutate { ptr -> updateConfigNative(ptr, configJson) }
     }
 
     private external fun updateEnableAudioOutputNative(llmPtr: Long, enable: Boolean)
@@ -327,14 +240,11 @@ class LlmSession (
                 Timber.d("MNN_DEBUG submitFullHistory intercepted by mockLatex")
                 return submitMockLatexHistory(progressListener)
             }
-            //Use Timber instead of Log
-            Timber.d("MNN_DEBUG submitFullHistory with ${history.size} messages")
-            //Type conversion: kotlin.Pair -> android.util.Pair
-            val androidHistory = history.map { android.util.Pair(it.first, it.second) }
-            //Call JNI method, remove unnecessary type conversion
-            val result = submitFullHistoryNative(nativePtr, androidHistory, progressListener)
-            generating = false
-            return result
+            return lifecycle.generate { ptr ->
+                Timber.d("MNN_DEBUG submitFullHistory with ${history.size} messages")
+                val androidHistory = history.map { android.util.Pair(it.first, it.second) }
+                submitFullHistoryNative(ptr, androidHistory, progressListener)
+            }
         }
     }
 
@@ -357,8 +267,6 @@ class LlmSession (
                 progressListener.onProgress(null) // notify completion
             } catch (e: Exception) {
                 Timber.e(e, "Mock generation failed")
-            } finally {
-                generating = false
             }
         }.start()
         val map = HashMap<String, Any>()
@@ -382,7 +290,7 @@ class LlmSession (
     }
 
     fun getSystemPrompt(): String? {
-        return getSystemPromptNative(nativePtr)
+        return lifecycle.withIdleHandle { ptr -> if (ptr != 0L) getSystemPromptNative(ptr) else null }
     }
 
     private external fun getSystemPromptNative(llmPtr: Long): String?
@@ -390,11 +298,7 @@ class LlmSession (
     private external fun dumpConfigNative(llmPtr: Long): String
 
     fun dumpConfig(): String {
-        return if (nativePtr != 0L) {
-            dumpConfigNative(nativePtr)
-        } else {
-            "{}"
-        }
+        return lifecycle.withIdleHandle { ptr -> if (ptr != 0L) dumpConfigNative(ptr) else "{}" }
     }
 
     // Helper function to get current memory usage in MB
@@ -427,22 +331,24 @@ class LlmSession (
         // Use coroutine instead of Thread for better lifecycle management
         return try {
             // Run the actual benchmark in C++ following llm_bench.cpp structure
-            runBenchmarkNative(
-                nativePtr, 
-                commandParams.backend,
-                commandParams.threads,
-                commandParams.useMmap,
-                commandParams.power,
-                commandParams.precision,
-                commandParams.memory,
-                commandParams.dynamicOption,
-                commandParams.nPrompt,
-                commandParams.nGenerate,
-                commandParams.nRepeat,
-                commandParams.kvCache == "true",
-                testInstance,
-                callback
-            )
+            lifecycle.generate { ptr ->
+                runBenchmarkNative(
+                    ptr,
+                    commandParams.backend,
+                    commandParams.threads,
+                    commandParams.useMmap,
+                    commandParams.power,
+                    commandParams.precision,
+                    commandParams.memory,
+                    commandParams.dynamicOption,
+                    commandParams.nPrompt,
+                    commandParams.nGenerate,
+                    commandParams.nRepeat,
+                    commandParams.kvCache == "true",
+                    testInstance,
+                    callback
+                )
+            }
         } catch (e: Exception) {
             com.alibaba.mnnllm.android.benchmark.BenchmarkResult(
                 testInstance = testInstance,

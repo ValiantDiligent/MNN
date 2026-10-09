@@ -6,7 +6,6 @@ package com.alibaba.mnnllm.android.llm
 import android.util.Log
 import com.alibaba.mnnllm.android.chat.model.ChatDataItem
 import com.alibaba.mnnllm.android.llm.ChatService.Companion.provide
-import com.alibaba.mnnllm.android.llm.LlmSession.Companion.TAG
 
 class DiffusionSession(
     private val modelId: String,
@@ -15,21 +14,12 @@ class DiffusionSession(
     private var savedHistory: List<ChatDataItem>? = null
 ): ChatSession{
     override var supportOmni: Boolean = false
-    private var nativePtr: Long = 0
+    private val lifecycle = NativeSessionLifecycle(::releaseNative) { provide().removeSession(this) }
     override val debugInfo: String = ""
-    @Volatile
-    private var releaseRequested = false
-    @Volatile
-    private var generating = false
-    
+
     override fun load() {
-        nativePtr = initNative(
-            configPath,
-            DiffusionLoadConfigResolver.buildExtraConfigJson(modelId, configPath)
-        )
-        Log.d(TAG, "DiffusionSession load nativePtr=$nativePtr configPath=$configPath")
-        if (releaseRequested) {
-            release()
+        lifecycle.load {
+            initNative(configPath, DiffusionLoadConfigResolver.buildExtraConfigJson(modelId, configPath))
         }
     }
 
@@ -39,47 +29,18 @@ class DiffusionSession(
         progressListener: GenerateProgressListener
     ): HashMap<String, Any> {
         synchronized(this) {
-            Log.d(TAG, "MNN_DEBUG submit$prompt")
-            if (nativePtr == 0L) {
-                Log.e(TAG, "Diffusion nativePtr is 0, cannot generate")
-                return hashMapOf<String, Any>(
-                    "error" to true,
-                    "message" to "Native diffusion session not initialized"
-                )
+            if (!lifecycle.isLoaded()) {
+                return hashMapOf("error" to true, "message" to "Native diffusion session not initialized")
             }
-            generating = true
-            val output = params["output"] as String
-            val iterNum = params["iterNum"] as Int
-            val randomSeed = params["randomSeed"] as Int
-            val nativeResult = submitDiffusionNative(
-                nativePtr,
-                prompt,
-                output,
-                iterNum,
-                randomSeed,
-                progressListener
-            )
-            val result: HashMap<String, Any> = nativeResult ?: hashMapOf<String, Any>(
-                "error" to true,
-                "message" to "Native diffusion returned null"
-            )
-            generating = false
-            if (releaseRequested) {
-                releaseInner()
+            return lifecycle.generate { ptr ->
+                val output = params["output"] as String
+                val iterNum = params["iterNum"] as Int
+                val randomSeed = params["randomSeed"] as Int
+                submitDiffusionNative(ptr, prompt, output, iterNum, randomSeed, progressListener)
+                    ?: hashMapOf("error" to true, "message" to "Native diffusion returned null")
             }
-            return result
         }
     }
-
-    private fun releaseInner() {
-        if (nativePtr != 0L) {
-            releaseNative(nativePtr)
-            nativePtr = 0
-            provide().removeSession(sessionId)
-            (this as Object).notifyAll()
-        }
-    }
-
 
     private external fun submitDiffusionNative(
         instanceId: Long,
@@ -100,14 +61,7 @@ class DiffusionSession(
     }
 
     override fun release() {
-        synchronized(this) {
-            Log.d(TAG, "MNN_DEBUG release nativePtr: $nativePtr generating: $generating")
-            if (!generating) {
-                releaseInner()
-            } else {
-                releaseRequested = true
-            }
-        }
+        lifecycle.release()
     }
 
     override fun setKeepHistory(keepHistory: Boolean) {

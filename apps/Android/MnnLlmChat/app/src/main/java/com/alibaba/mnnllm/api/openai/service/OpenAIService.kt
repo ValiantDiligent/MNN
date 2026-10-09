@@ -11,7 +11,6 @@ import android.os.Build
 import android.os.IBinder
 import androidx.core.content.ContextCompat
 import com.alibaba.mnnllm.android.chat.ChatActivity
-import com.alibaba.mnnllm.api.openai.di.ServiceLocator
 import com.alibaba.mnnllm.api.openai.manager.ApiNotificationManager
 import com.alibaba.mnnllm.api.openai.manager.CurrentModelManager
 import kotlinx.coroutines.CoroutineScope
@@ -29,8 +28,9 @@ class OpenAIService : Service() {
     private var startRequestCount: Int = 0
 
     companion object {
-        private var isServiceRunning = false
-        private var activeInstance: OpenAIService? = null
+        private val instanceLock = Any()
+        @Volatile private var isServiceRunning = false
+        @Volatile private var activeInstance: OpenAIService? = null
 
         fun getInstance(): OpenAIService? = activeInstance
 
@@ -109,15 +109,20 @@ class OpenAIService : Service() {
 
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        isServiceRunning = true
-        startRequestCount += 1
-
-        val previousModelId = currentModelId
         val requestedModelId = intent?.getStringExtra("modelId")
-        if (!requestedModelId.isNullOrBlank()) {
-            currentModelId = requestedModelId
-            CurrentModelManager.setCurrentModelId(requestedModelId)
-            Timber.tag(TAG).i("Service started with modelId: $requestedModelId")
+        val previousModelId: String?
+        val requestId: Int
+        val startModelId: String?
+        synchronized(instanceLock) {
+            if (activeInstance !== this) return START_NOT_STICKY
+            isServiceRunning = true
+            requestId = ++startRequestCount
+            previousModelId = currentModelId
+            if (!requestedModelId.isNullOrBlank()) {
+                currentModelId = requestedModelId
+                CurrentModelManager.setCurrentModelId(requestedModelId)
+            }
+            startModelId = currentModelId
         }
 
         val notification = coordinator.getNotification()
@@ -130,13 +135,16 @@ class OpenAIService : Service() {
         }
 
         // Run startServer off main thread to avoid ANR: ensureSession (llmSession.load) is heavy
-        val startModelId = if (!requestedModelId.isNullOrBlank()) requestedModelId else currentModelId
         serviceScope.launch {
             val startSuccess = coordinator.startServer(startModelId)
             if (!startSuccess && !requestedModelId.isNullOrBlank()) {
-                currentModelId = previousModelId
-                syncCurrentModelManager(previousModelId)
-                Timber.tag(TAG).w("Failed to switch service runtime model, rolled back to previous modelId: $previousModelId")
+                synchronized(instanceLock) {
+                    // A failed old request/instance must not overwrite a newer service's model.
+                    if (activeInstance === this@OpenAIService && requestId == startRequestCount) {
+                        currentModelId = previousModelId
+                        syncCurrentModelManager(previousModelId)
+                    }
+                }
             }
         }
         return START_NOT_STICKY
@@ -144,7 +152,7 @@ class OpenAIService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        activeInstance = this
+        synchronized(instanceLock) { activeInstance = this }
         coordinator = ApiServiceCoordinator(this)
         coordinator.initialize()
     }
@@ -158,9 +166,6 @@ class OpenAIService : Service() {
         Timber.tag(TAG).i("Service is being destroyed")
         serviceScope.cancel()
         cleanup()
-        if (activeInstance == this) {
-            activeInstance = null
-        }
         super.onDestroy()
     }
 
@@ -183,9 +188,19 @@ class OpenAIService : Service() {
             Timber.tag(TAG).e(e, "Failed to cleanup coordinator")
         }
         
-        //clearglobalmodelID
-        CurrentModelManager.clearCurrentModelId()
-        ServiceLocator.getLlmRuntimeController().releaseSession()
+        // The coordinator stops its own network before releasing its captured lease on IO.
+        // Only the active Service instance may clear process-global UI state.
+        val ownsGlobals = synchronized(instanceLock) {
+            if (activeInstance === this) {
+                activeInstance = null
+                isServiceRunning = false
+                CurrentModelManager.clearCurrentModelId()
+                true
+            } else {
+                false
+            }
+        }
+        if (!ownsGlobals) return
 
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {

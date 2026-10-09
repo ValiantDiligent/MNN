@@ -10,7 +10,8 @@ import timber.log.Timber
 object DefaultLlmRuntimeController : LlmRuntimeController {
     private val lock = Any()
     private var activeModelId: String? = null
-    private var activeSession: LlmSession? = null
+    private val ownership = RuntimeSessionOwnership<LlmSession>()
+    private val ownedSession: LlmSession? get() = ownership.session
     private var activeUseAppConfig: Boolean = false
 
     override fun ensureSession(
@@ -23,7 +24,7 @@ object DefaultLlmRuntimeController : LlmRuntimeController {
         deferLoad: Boolean
     ): EnsureSessionResult {
         synchronized(lock) {
-            val currentSession = activeSession
+            val currentSession = ownedSession
             if (
                 currentSession != null &&
                 RuntimeSessionReusePolicy.shouldReuse(
@@ -38,7 +39,8 @@ object DefaultLlmRuntimeController : LlmRuntimeController {
                 return EnsureSessionResult(
                     success = true,
                     session = currentSession,
-                    modelId = modelId
+                    modelId = modelId,
+                    leaseToken = ownership.acquire(currentSession)
                 )
             }
 
@@ -71,23 +73,24 @@ object DefaultLlmRuntimeController : LlmRuntimeController {
                 )
 
                 val llmSession = chatSession as? LlmSession
-                    ?: return EnsureSessionResult(
-                        success = false,
-                        modelId = modelId,
-                        reason = "SESSION_NOT_LLM"
-                    )
+                if (llmSession == null) {
+                    chatSession.release()
+                    return EnsureSessionResult(false, modelId = modelId, reason = "SESSION_NOT_LLM")
+                }
 
+                // Register before load so an init exception also closes the created session.
+                val leaseToken = ownership.acquire(llmSession)
+                activeModelId = modelId
+                activeUseAppConfig = useAppConfig
                 llmSession.setKeepHistory(true)
                 if (!deferLoad) {
                     llmSession.load()
                 }
-                activeSession = llmSession
-                activeModelId = modelId
-                activeUseAppConfig = useAppConfig
                 EnsureSessionResult(
                     success = true,
                     session = llmSession,
-                    modelId = modelId
+                    modelId = modelId,
+                    leaseToken = leaseToken
                 )
             }.getOrElse { error ->
                 Timber.w(error, "ensureSession failed for modelId=%s", modelId)
@@ -101,9 +104,22 @@ object DefaultLlmRuntimeController : LlmRuntimeController {
         }
     }
 
+    override fun acquireActiveSession(): EnsureSessionResult {
+        synchronized(lock) {
+            val session = getActiveSession()
+                ?: return EnsureSessionResult(false, reason = "NO_ACTIVE_SESSION")
+            return EnsureSessionResult(
+                success = true,
+                session = session,
+                modelId = activeModelId,
+                leaseToken = ownership.acquire(session)
+            )
+        }
+    }
+
     override fun getActiveSession(): LlmSession? {
         synchronized(lock) {
-            val session = activeSession ?: return null
+            val session = ownedSession ?: return null
             return session.takeIf {
                 RuntimeSessionReusePolicy.shouldExposeActiveSession(it.isModelLoaded())
             }
@@ -143,14 +159,21 @@ object DefaultLlmRuntimeController : LlmRuntimeController {
         }
     }
 
-    private fun releaseSessionLocked() {
-        runCatching {
-            activeSession?.release()
-        }.onFailure { error ->
-            Timber.w(error, "releaseSession failed")
+    override fun releaseSession(leaseToken: SessionLeaseToken): Boolean {
+        synchronized(lock) {
+            return releaseSessionLocked(leaseToken)
         }
-        activeSession = null
-        activeModelId = null
-        activeUseAppConfig = false
+    }
+
+    private fun releaseSessionLocked(leaseToken: SessionLeaseToken? = null): Boolean {
+        return ownership.release(leaseToken) { session ->
+            activeModelId = null
+            activeUseAppConfig = false
+            runCatching {
+                session.release()
+            }.onFailure { error ->
+                Timber.w(error, "releaseSession failed")
+            }
+        }
     }
 }
