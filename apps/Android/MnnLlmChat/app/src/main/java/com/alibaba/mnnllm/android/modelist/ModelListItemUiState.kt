@@ -59,6 +59,16 @@ internal object ModelListItemUiStateFactory {
                 } else {
                     statusMessage
                 }
+            } else if (downloadInfo?.downloadState == DownloadState.FAILED) {
+                updateButtonText = context.getString(R.string.download_resume)
+                updateButtonEnabled = true
+                // Download errors may contain private URLs; show only the localized state.
+                val statusMessage = context.getString(R.string.download_state_failed)
+                statusText = if (formattedSize.isNotEmpty()) {
+                    "$formattedSize ($statusMessage)"
+                } else {
+                    statusMessage
+                }
             } else {
                 updateButtonText = context.getString(R.string.update)
                 updateButtonEnabled = true

@@ -14,7 +14,6 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InputStream
-import java.io.OutputStream
 import java.nio.file.FileVisitOption
 import java.nio.file.FileVisitResult
 import java.nio.file.Files
@@ -93,35 +92,21 @@ object FileUtils {
 
     @Throws(IOException::class)
     fun copyFileUriToPath(context: Context, fileUri: Uri, destFilePath: String): File {
-        var inputStream: InputStream? = null
-        var outputStream: OutputStream? = null
-        try {
-            // Open an InputStream from the Uri
-            inputStream = context.contentResolver.openInputStream(fileUri)
-            requireNotNull(inputStream) { "Unable to open InputStream from Uri" }
-            // Create the destination file
+        return copyInputStreamToPath(destFilePath) {
+            context.contentResolver.openInputStream(fileUri)
+        }
+    }
+
+    @Throws(IOException::class)
+    internal fun copyInputStreamToPath(destFilePath: String, openInputStream: () -> InputStream?): File {
+        val inputStream = openInputStream() ?: throw IOException("Unable to open InputStream from Uri")
+        return inputStream.use { input ->
             val destinationFile = File(destFilePath)
             ensureParentDirectoriesExist(destinationFile)
-            outputStream = Files.newOutputStream(destinationFile.toPath())
-
-            // Buffer for data transfer
-            val buffer = ByteArray(4096)
-            var bytesRead: Int
-            while ((inputStream.read(buffer).also { bytesRead = it }) != -1) {
-                outputStream.write(buffer, 0, bytesRead)
+            Files.newOutputStream(destinationFile.toPath()).use { output ->
+                input.copyTo(output, 4096)
             }
-            outputStream.flush()
-
-            return destinationFile
-        } finally {
-            try {
-                inputStream?.close()
-            } catch (ignored: Exception) {
-            }
-            try {
-                outputStream?.close()
-            } catch (ignored: Exception) {
-            }
+            destinationFile
         }
     }
 

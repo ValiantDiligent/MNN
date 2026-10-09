@@ -6,10 +6,14 @@ import com.alibaba.mnnllm.android.llm.LlmSession
 import com.alibaba.mnnllm.api.openai.di.ServiceLocator
 import com.alibaba.mnnllm.api.openai.network.compat.AnthropicAdapter
 import com.alibaba.mnnllm.api.openai.network.compat.AnthropicMessagesRequest
-import com.alibaba.mnnllm.api.openai.network.compat.AnthropicUsage
 import com.alibaba.mnnllm.api.openai.network.logging.ChatLogger
 import com.alibaba.mnnllm.api.openai.network.processors.MnnImageProcessor
 import com.alibaba.mnnllm.api.openai.network.queue.RequestQueueManager
+import com.alibaba.mnnllm.api.openai.network.utils.GenerationException
+import com.alibaba.mnnllm.api.openai.network.utils.GenerationProtocol
+import com.alibaba.mnnllm.api.openai.network.utils.GenerationResponse
+import com.alibaba.mnnllm.api.openai.network.utils.GenerationSubmitter
+import com.alibaba.mnnllm.api.openai.network.utils.RequestCancellation
 import com.alibaba.mnnllm.api.openai.network.utils.MessageTransformer
 import com.alibaba.mnnllm.api.openai.network.validators.ChatRequestValidator
 import io.ktor.http.ContentType
@@ -20,8 +24,8 @@ import io.ktor.server.response.respondText
 import io.ktor.server.sse.SSEServerContent
 import io.ktor.server.sse.heartbeat
 import io.ktor.sse.ServerSentEvent
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
 import java.util.UUID
 import kotlin.time.Duration.Companion.seconds
 
@@ -64,12 +68,11 @@ class AnthropicMessagesService {
                     logger.logError(traceId, exception, "Anthropic queue failed, requestId=$requestId")
                 }
             )
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             logger.logError(traceId, e, "Anthropic queue submit failed")
-            call.respond(
-                HttpStatusCode.InternalServerError,
-                mapOf("error" to mapOf("message" to "Queue processing failed", "trace_id" to traceId))
-            )
+            if (!call.response.isCommitted) respondError(call, e)
         }
     }
 
@@ -81,17 +84,7 @@ class AnthropicMessagesService {
         try {
             val llmSession = getLlmSession()
             if (llmSession == null) {
-                logger.logInfo(traceId, "No active LLM session available")
-                call.respond(
-                    HttpStatusCode.ServiceUnavailable,
-                    mapOf<String, Any>(
-                        "error" to mapOf<String, String>(
-                            "type" to "api_error",
-                            "message" to "No active LLM session available. Please ensure a model is loaded."
-                        )
-                    )
-                )
-                return
+                throw GenerationException("No active LLM session available. Please ensure a model is loaded.", 503)
             }
 
             val openAiRequest = AnthropicAdapter.toOpenAIRequest(request)
@@ -106,17 +99,11 @@ class AnthropicMessagesService {
             } else {
                 handleNonStreamResponse(call, unifiedHistory, request.model ?: "mnn-local", llmSession)
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             logger.logError(traceId, e, "Anthropic generation failed")
-            call.respond(
-                HttpStatusCode.InternalServerError,
-                mapOf<String, Any>(
-                    "error" to mapOf<String, String>(
-                        "type" to "api_error",
-                        "message" to (e.message ?: "Internal server error")
-                    )
-                )
-            )
+            if (!call.response.isCommitted) respondError(call, e)
         }
     }
 
@@ -126,23 +113,8 @@ class AnthropicMessagesService {
         model: String,
         llmSession: LlmSession
     ) {
-        val fullResponse = StringBuilder()
-        val result = llmSession.submitFullHistory(history, object : GenerateProgressListener {
-            override fun onProgress(progress: String?): Boolean {
-                progress?.let { fullResponse.append(it) }
-                return false
-            }
-        })
-
-        val usage = usageFromMetrics(result)
-        val responseJson = AnthropicAdapter.createNonStreamResponse(
-            responseId = "msg_${System.currentTimeMillis()}",
-            model = model,
-            text = fullResponse.toString(),
-            usage = usage
-        )
-
-        call.respondText(responseJson, ContentType.Application.Json)
+        val response = createResponse(model).nonStream(submitter(llmSession, history))
+        call.respondText(response.body, ContentType.Application.Json, HttpStatusCode.fromValue(response.status))
     }
 
     private suspend fun handleStreamResponse(
@@ -152,59 +124,37 @@ class AnthropicMessagesService {
         traceId: String,
         llmSession: LlmSession
     ) {
-        val responseId = "msg_${System.currentTimeMillis()}"
-
+        val response = createResponse(model)
+        val cancellation = RequestCancellation.from(currentCoroutineContext())
         call.respond(SSEServerContent(call) {
             heartbeat {
                 period = 3.seconds
                 event = ServerSentEvent(comments = "keep-alive")
             }
-
-            send(ServerSentEvent(event = "message_start", data = "{\"type\":\"message_start\",\"message\":{\"id\":\"$responseId\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"$model\",\"content\":[],\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}"))
-            send(ServerSentEvent(event = "content_block_start", data = "{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}"))
-
-            val channel = kotlinx.coroutines.channels.Channel<ServerSentEvent>(kotlinx.coroutines.channels.Channel.UNLIMITED)
-            var metrics = hashMapOf<String, Any>()
-
-            launch(kotlinx.coroutines.Dispatchers.IO) {
-                try {
-                    metrics = llmSession.submitFullHistory(history, object : GenerateProgressListener {
-                        override fun onProgress(progress: String?): Boolean {
-                            if (progress == null) {
-                                return false
-                            }
-                            val safeText = progress
-                                .replace("\\", "\\\\")
-                                .replace("\"", "\\\"")
-                                .replace("\n", "\\n")
-                            val deltaData = "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"$safeText\"}}"
-                            channel.trySend(ServerSentEvent(event = "content_block_delta", data = deltaData))
-                            return false
-                        }
-                    })
-                } catch (e: Exception) {
-                    logger.logError(traceId, e, "Anthropic stream generation failed")
-                } finally {
-                    val usage = usageFromMetrics(metrics)
-                    val messageDelta = "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":${usage.input_tokens},\"output_tokens\":${usage.output_tokens}}}"
-                    channel.trySend(ServerSentEvent(event = "content_block_stop", data = "{\"type\":\"content_block_stop\",\"index\":0}"))
-                    channel.trySend(ServerSentEvent(event = "message_delta", data = messageDelta))
-                    channel.trySend(ServerSentEvent(event = "message_stop", data = "{\"type\":\"message_stop\"}"))
-                    delay(50)
-                    channel.close()
-                }
-            }
-
-            for (event in channel) {
-                send(event)
+            try {
+                response.stream(submitter(llmSession, history), cancellation) { send(it) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.logWarning(traceId, "Client connection closed during Anthropic SSE send", e)
             }
         })
     }
 
-    private fun usageFromMetrics(metrics: HashMap<String, Any>): AnthropicUsage {
-        val promptTokens = (metrics["prompt_len"] as? Long)?.toInt() ?: 0
-        val outputTokens = (metrics["decode_len"] as? Long)?.toInt() ?: 0
-        return AnthropicUsage(input_tokens = promptTokens, output_tokens = outputTokens)
+    private fun createResponse(model: String = "mnn-local") = GenerationResponse(
+        GenerationProtocol.ANTHROPIC, "msg_${System.currentTimeMillis()}", model = model
+    )
+
+    private fun submitter(llmSession: LlmSession, history: List<android.util.Pair<String, String>>) =
+        GenerationSubmitter { onProgress ->
+            llmSession.submitFullHistory(history, object : GenerateProgressListener {
+                override fun onProgress(progress: String?) = onProgress.invoke(progress)
+            })
+        }
+
+    private suspend fun respondError(call: ApplicationCall, error: Exception) {
+        val response = createResponse().errorResponse(error)
+        call.respondText(response.body, ContentType.Application.Json, HttpStatusCode.fromValue(response.status))
     }
 
     private fun getLlmSession(): LlmSession? {

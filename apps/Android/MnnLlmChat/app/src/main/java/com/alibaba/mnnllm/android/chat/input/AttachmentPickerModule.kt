@@ -21,6 +21,7 @@ import com.alibaba.mnnllm.android.R
 import com.alibaba.mnnllm.android.chat.ChatActivity
 import com.alibaba.mnnllm.android.utils.FileUtils
 import com.alibaba.mnnllm.android.model.ModelTypeUtils
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -180,22 +181,25 @@ class AttachmentPickerModule(private val activity: ChatActivity) {
     }
     
     private fun startCameraIntent() {
+        val sessionId = activity.sessionId
+        if (sessionId.isNullOrBlank()) {
+            showImportFailure(AttachmentType.Image, IOException("Missing attachment session"))
+            return
+        }
         val cameraIntent = Intent(MediaStore.ACTION_IMAGE_CAPTURE)
-        photoFile = File(
-            FileUtils.generateDestPhotoFilePath(
-                this.activity,
-                activity.sessionId!!
-            )
-        )
-        imageUri = Uri.fromFile(photoFile)
-        val fileProviderUri = FileProvider.getUriForFile(
-            this.activity,
-            activity.packageName + ".fileprovider",
-            photoFile!!
-        )
-        cameraIntent.putExtra(MediaStore.EXTRA_OUTPUT, fileProviderUri)
         try {
+            val destination = File(FileUtils.generateDestPhotoFilePath(activity, sessionId))
+            val fileProviderUri = FileProvider.getUriForFile(
+                activity,
+                activity.packageName + ".fileprovider",
+                destination
+            )
+            cameraIntent.putExtra(MediaStore.EXTRA_OUTPUT, fileProviderUri)
             activity.startActivityForResult(cameraIntent, REQUEST_CODE_CAPTURE_IMAGE)
+            photoFile = destination
+            imageUri = Uri.fromFile(destination)
+        } catch (e: IOException) {
+            showImportFailure(AttachmentType.Image, e)
         } catch (e: SecurityException) {
             Log.e(TAG, "Camera permission denied", e)
             Toast.makeText(activity, R.string.camera_permission_denied, Toast.LENGTH_SHORT).show()
@@ -216,87 +220,66 @@ class AttachmentPickerModule(private val activity: ChatActivity) {
     }
 
     fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        if (requestCode == REQUEST_CODE_CAPTURE_IMAGE) {
-            if (resultCode == Activity.RESULT_OK) {
-                if (imageUri != null) {
-                    val imagePath = imageUri?.path
-                    Log.d("ImagePath", "Image saved to: $imagePath")
-                    imagePreviewAdapter.addImage(imageUri!!)
-                    showImagePreview()
-                }
+        if (resultCode != Activity.RESULT_OK) {
+            if (requestCode == REQUEST_CODE_CAPTURE_IMAGE) {
+                imageUri = null
             }
-            imageUri = null
-        } else if (requestCode == REQUEST_CODE_SELECT_IMAGE) {
-            if (resultCode == Activity.RESULT_OK && data != null) {
-                val uris = mutableListOf<Uri>()
-                if (data.clipData != null) {
-                    val count = data.clipData!!.itemCount
-                    for (i in 0 until count) {
-                        uris.add(data.clipData!!.getItemAt(i).uri)
-                    }
-                } else if (data.data != null) {
-                    uris.add(data.data!!)
+            return
+        }
+        when (requestCode) {
+            REQUEST_CODE_CAPTURE_IMAGE -> {
+                val capturedUri = imageUri
+                imageUri = null
+                if (capturedUri == null || activity.sessionId.isNullOrBlank()) {
+                    showImportFailure(AttachmentType.Image, IOException("Missing captured image or session"))
+                    return
                 }
+                imagePreviewAdapter.addImage(capturedUri)
+                showImagePreview()
+            }
+            REQUEST_CODE_SELECT_IMAGE -> importPickedAttachment(data, AttachmentType.Image)
+            REQUEST_CODE_SELECT_VIDEO -> importPickedAttachment(data, AttachmentType.Video)
+            REQUEST_CODE_SELECT_WAV -> importPickedAttachment(data, AttachmentType.Audio)
+        }
+    }
 
-                if (uris.isNotEmpty()) {
-                    val processedUris = mutableListOf<Uri>()
-                    for (uri in uris) {
-                        try {
-                            val destImageFile = FileUtils.generateDestImageFilePath(
-                                this.activity,
-                                activity.sessionId!!
-                            )
-                            FileUtils.copyFileUriToPath(
-                                this.activity,
-                                uri,
-                                destImageFile
-                            )
-                            processedUris.add(Uri.fromFile(File(destImageFile)))
-                        } catch (e: IOException) {
-                            Log.e(TAG, "get file failed ", e)
-                        }
-                    }
-                    if (processedUris.isNotEmpty()) {
-                        imagePreviewAdapter.addImages(processedUris)
+    private fun importPickedAttachment(data: Intent?, type: AttachmentType) {
+        importAttachmentResult(
+            data = data,
+            sessionId = activity.sessionId,
+            allowMultiple = type == AttachmentType.Image,
+            copy = { uri, sessionId ->
+                val path = File(when (type) {
+                    AttachmentType.Image -> FileUtils.generateDestImageFilePath(activity, sessionId)
+                    AttachmentType.Audio -> FileUtils.generateDestAudioFilePath(activity, sessionId)
+                    AttachmentType.Video -> FileUtils.generateDestVideoFilePath(activity, sessionId)
+                })
+                // Do not overwrite an existing attachment when imports share a timestamp.
+                val destination = File.createTempFile(path.nameWithoutExtension + "_", "." + path.extension, path.parentFile)
+                Uri.fromFile(FileUtils.copyFileUriToPath(activity, uri, destination.absolutePath))
+            },
+            onImported = { uris ->
+                when (type) {
+                    AttachmentType.Image -> {
+                        imagePreviewAdapter.addImages(uris)
                         showImagePreview()
                     }
+                    AttachmentType.Audio -> showAudioPreview(uris.first())
+                    AttachmentType.Video -> showVideoPreview(uris.first())
                 }
-            }
-        } else if (requestCode == REQUEST_CODE_SELECT_VIDEO) {
-            if (resultCode == Activity.RESULT_OK) {
-                val videoUri = data!!.data
-                try {
-                    val destVideoPath = FileUtils.generateDestVideoFilePath(
-                        this.activity,
-                        activity.sessionId!!
-                    )
-                    val destFile =
-                        FileUtils.copyFileUriToPath(this.activity, videoUri!!, destVideoPath)
-                    showVideoPreview(Uri.fromFile(destFile))
-                } catch (e: IOException) {
-                    Log.e(TAG, "get video file failed", e)
-                    Toast.makeText(this.activity, R.string.video_file_failed, Toast.LENGTH_SHORT)
-                        .show()
-                }
-            }
-        } else if (requestCode == REQUEST_CODE_SELECT_WAV) {
-            if (resultCode == Activity.RESULT_OK) {
-                val audioUri = data!!.data
-                try {
-                    val destAudioPath = FileUtils.generateDestAudioFilePath(
-                        this.activity,
-                        activity.sessionId!!
-                    )
-                    val destFile =
-                        FileUtils.copyFileUriToPath(this.activity, audioUri!!, destAudioPath)
-                    showAudioPreview(Uri.fromFile(destFile))
-                } catch (e: IOException) {
-                    Log.e(TAG, "get audio file failed", e)
-                    Toast.makeText(this.activity, R.string.audio_file_failed, Toast.LENGTH_SHORT)
-                        .show()
-                }
-            }
+            },
+            onFailure = { showImportFailure(type, it) }
+        )
+    }
+
+    private fun showImportFailure(type: AttachmentType, error: Exception) {
+        Log.e(TAG, "Failed to import $type attachment", error)
+        val message = when (type) {
+            AttachmentType.Image -> R.string.failed_to_save_image
+            AttachmentType.Audio -> R.string.audio_file_failed
+            AttachmentType.Video -> R.string.video_file_failed
         }
+        Toast.makeText(activity, message, Toast.LENGTH_SHORT).show()
     }
     
     fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
@@ -342,6 +325,8 @@ class AttachmentPickerModule(private val activity: ChatActivity) {
                         callback!!.onAttachmentPicked(listOf(videoUri), AttachmentType.Video)
                     }
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
                     attachmentPreview.setImageResource(R.drawable.ic_video)

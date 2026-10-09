@@ -13,6 +13,7 @@ import com.alibaba.mnnllm.api.openai.network.validators.ChatRequestValidator
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.response.respond
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.runBlocking
 import java.util.UUID
 
@@ -73,6 +74,9 @@ class MNNChatService {
                     logger.logError(traceId, exception, "队列任务失败，requestId=$requestId")
                 }
             )
+        } catch (e: CancellationException) {
+            // A disconnected request is not a server failure; keep cancellation propagating.
+            throw e
         } catch (e: Exception) {
             logger.logError(traceId, e, "队列处理失败，requestId=$requestId")
             call.respond(
@@ -120,6 +124,9 @@ class MNNChatService {
 
                 logger.logInferenceComplete(traceId)
             }
+        } catch (e: CancellationException) {
+            // A disconnected request is not a server failure; keep cancellation propagating.
+            throw e
         } catch (e: Exception) {
             logger.logError(traceId, e, "LLM生成失败")
             call.respond(

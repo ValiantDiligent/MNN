@@ -186,7 +186,10 @@ class ModelListPresenter(private val context: Context, private val view: ModelLi
 
     override fun onDownloadFailed(modelId: String, exception: Exception) {
         Log.e(TAG, "onDownloadFailed: $modelId", exception)
-        // Not needed for model list
+        mainHandler?.post {
+            // Rebind the failed update so the retry button is enabled again.
+            modelListAdapter?.updateItem(modelId)
+        }
     }
 
     override fun onDownloadFinished(modelId: String, path: String) {

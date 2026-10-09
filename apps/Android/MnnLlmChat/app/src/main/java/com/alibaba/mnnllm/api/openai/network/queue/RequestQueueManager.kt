@@ -1,72 +1,72 @@
 package com.alibaba.mnnllm.api.openai.network.queue
 
+import com.alibaba.mnnllm.api.openai.network.utils.RequestCancellation
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import timber.log.Timber
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
-/**
- * Request queue manager
- * Ensures LLM generation tasks execute in order, only one task can run at the same time
- */
-class RequestQueueManager private constructor() {
-    
+/** FIFO queue: cancellation cannot release a slot until synchronous generation has exited. */
+class RequestQueueManager internal constructor(dispatcher: CoroutineDispatcher = Dispatchers.IO) {
     companion object {
         @Volatile
         private var INSTANCE: RequestQueueManager? = null
-        
-        fun getInstance(): RequestQueueManager {
-            return INSTANCE ?: synchronized(this) {
-                INSTANCE ?: RequestQueueManager().also { INSTANCE = it }
-            }
+
+        fun getInstance(): RequestQueueManager = INSTANCE ?: synchronized(this) {
+            INSTANCE ?: RequestQueueManager().also { INSTANCE = it }
         }
     }
-    
-    // Request queue
-    private val requestQueue = Channel<QueuedRequest>(Channel.UNLIMITED)
-    
-    // Queue processing coroutine scope
-    private val queueScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    
-    // Whether currently processing requests
-    private val isProcessing = AtomicInteger(0)
-    
-    // Queue statistics
+
+    private val pendingRequests = AtomicInteger(0)
+    private val isProcessing = AtomicBoolean(false)
     private val totalRequests = AtomicLong(0)
     private val completedRequests = AtomicLong(0)
     private val failedRequests = AtomicLong(0)
-    
-    // Mutex for protecting queue state
     private val queueMutex = Mutex()
-    
-    init {
-        startQueueProcessor()
-    }
-    
-    /**
-     * Queued request data class
-     */
-    private data class QueuedRequest(
+    private val queueScope = CoroutineScope(dispatcher + SupervisorJob())
+    private val requestQueue = Channel<QueuedRequest>(Channel.UNLIMITED, onUndeliveredElement = { it.cancel() })
+
+    private class QueuedRequest(
         val requestId: String,
         val traceId: String,
         val task: suspend () -> Unit,
-        val onComplete: () -> Unit = {},
-        val onError: (Exception) -> Unit = {},
-        val priority: Int = 0 // Priority, smaller number means higher priority
-    )
-    
-    /**
-     * Submit request to queue
-     * @param requestId Request ID
-     * @param traceId Trace ID
-     * @param task Task to execute
-     * @param onComplete Completion callback
-     * @param onError Error callback
-     * @param priority Priority (optional, default is 0)
-     */
+        val completion: CompletableDeferred<Result<Unit>>,
+        val cancellation: RequestCancellation,
+        val pendingCount: AtomicInteger,
+        val onComplete: () -> Unit,
+        val onError: (Exception) -> Unit
+    ) {
+        private val pending = AtomicBoolean(true)
+
+        fun leaveQueue() {
+            if (pending.compareAndSet(true, false)) pendingCount.decrementAndGet()
+        }
+
+        fun cancel() {
+            leaveQueue()
+            cancellation.cancel()
+            completion.cancel()
+        }
+    }
+
+    init {
+        queueScope.launch {
+            for (request in requestQueue) {
+                request.leaveQueue()
+                if (request.completion.isCancelled || request.cancellation.isCancelled) {
+                    request.cancel()
+                    continue
+                }
+                processRequest(request)
+            }
+        }
+    }
+
+    /** Priority is retained for call-site compatibility; requests are deliberately scheduled FIFO. */
     suspend fun submitRequest(
         requestId: String,
         traceId: String,
@@ -75,133 +75,88 @@ class RequestQueueManager private constructor() {
         onError: (Exception) -> Unit = {},
         priority: Int = 0
     ) {
-        // Use CompletableDeferred to wait for task completion
-        val taskCompletion = CompletableDeferred<Unit>()
-        
-        queueMutex.withLock {
-            val queuedRequest = QueuedRequest(
-                requestId = requestId,
-                traceId = traceId,
-                task = task,
-                onComplete = {
-                    onComplete()
-                    taskCompletion.complete(Unit)
-                },
-                onError = { exception ->
-                    onError(exception)
-                    taskCompletion.completeExceptionally(exception)
-                },
-                priority = priority
-            )
-            
-            totalRequests.incrementAndGet()
-            
-            Timber.tag("RequestQueue").d(
-                "Request added to queue: requestId=$requestId, traceId=$traceId, " +
-                "queue size=${getQueueSize()}, priority=$priority"
-            )
-            
-            requestQueue.send(queuedRequest)
+        val context = currentCoroutineContext()
+        context.ensureActive()
+        // Parent cancellation reaches this completion immediately. Failures are values so they do not
+        // cancel the HTTP request before the caller has a chance to report its protocol error.
+        val completion = CompletableDeferred<Result<Unit>>(context[Job])
+        val request = QueuedRequest(requestId, traceId, task, completion,
+            RequestCancellation.from(context), pendingRequests, onComplete, onError)
+        pendingRequests.incrementAndGet()
+        val cancellationHandle = completion.invokeOnCompletion {
+            if (completion.isCancelled) request.cancel()
         }
-        
-        // Wait for task completion
-        taskCompletion.await()
-    }
-    
-    /**
-     * Start queue processor
-     */
-    private fun startQueueProcessor() {
-        queueScope.launch {
-            Timber.tag("RequestQueue").i("Request queue processor started")
-            
-            for (request in requestQueue) {
-                try {
-                    // Process requests serially, no need for compareAndSet check
-                    // Because this coroutine itself is single-threaded
-                    processRequest(request)
-                } catch (e: Exception) {
-                    Timber.tag("RequestQueue").e(e, "Queue processor error occurred")
-                    // Handle failed request
-                    try {
-                        request.onError(e)
-                    } catch (callbackError: Exception) {
-                        Timber.tag("RequestQueue").e(callbackError, "Request error callback failed")
-                    }
-                }
-            }
-        }
-    }
-    
-    /**
-     * Process single request
-     */
-    private suspend fun processRequest(request: QueuedRequest) {
-        val startTime = System.currentTimeMillis()
-        
         try {
-            Timber.tag("RequestQueue").d(
-                "Start processing request: requestId=${request.requestId}, traceId=${request.traceId}"
-            )
-            
-            // Execute actual task
-            request.task()
-            
-            // Task completed
-            completedRequests.incrementAndGet()
-            request.onComplete()
-            
-            val duration = System.currentTimeMillis() - startTime
-            Timber.tag("RequestQueue").d(
-                "Request processing completed: requestId=${request.requestId}, " +
-                "duration=${duration}ms, remaining queue=${getQueueSize()}"
-            )
-            
-        } catch (e: Exception) {
-            // Task failed
-            failedRequests.incrementAndGet()
-            request.onError(e)
-            
-            val duration = System.currentTimeMillis() - startTime
-            Timber.tag("RequestQueue").e(
-                e, "Request processing failed: requestId=${request.requestId}, " +
-                "duration=${duration}ms, error: ${e.message}"
-            )
+            queueMutex.withLock {
+                context.ensureActive()
+                requestQueue.trySend(request).getOrThrow()
+                totalRequests.incrementAndGet()
+                Timber.tag("RequestQueue").d("Queued requestId=$requestId, traceId=$traceId, priority=$priority")
+            }
+            completion.await().getOrThrow()
+        } finally {
+            cancellationHandle.dispose()
+            if (!completion.isCompleted) request.cancel()
+            // Also covers failed enqueue or cancellation before the processor dequeues a tombstone.
+            request.leaveQueue()
         }
     }
-    
-    /**
-     * Get queue size (approximate value). Non-blocking to avoid ANR when called from main thread.
-     */
-    fun getQueueSize(): Int {
-        return requestQueue.tryReceive().let {
-            if (it.isSuccess) {
-                // Put item back asynchronously to avoid runBlocking (which would block caller)
-                val item = it.getOrThrow()
-                queueScope.launch { requestQueue.send(item) }
-                1 // At least one
-            } else {
-                0 // Queue is empty
+
+    private suspend fun processRequest(request: QueuedRequest) = coroutineScope {
+        isProcessing.set(true)
+        val execution = launch(request.cancellation, start = CoroutineStart.LAZY) {
+            try {
+                request.cancellation.ensureActive()
+                request.task()
+                currentCoroutineContext().ensureActive()
+                request.cancellation.ensureActive()
+                completedRequests.incrementAndGet()
+                notifySafely { request.onComplete() }
+                request.completion.complete(Result.success(Unit))
+            } catch (e: CancellationException) {
+                request.cancel()
+            } catch (e: Exception) {
+                failedRequests.incrementAndGet()
+                notifySafely { request.onError(e) }
+                request.completion.complete(Result.failure(e))
             }
         }
+        val cancellationHandle = request.completion.invokeOnCompletion {
+            if (request.completion.isCancelled) execution.cancel()
+        }
+        try {
+            execution.start()
+            execution.join()
+        } finally {
+            // Cancellation changes Job state, not the execution state of a blocking JNI call.
+            // Join the worker and its structured SSE children before advancing FIFO.
+            execution.cancel()
+            withContext(NonCancellable) { execution.join() }
+            cancellationHandle.dispose()
+            if (!request.completion.isCompleted) request.cancel()
+            isProcessing.set(false)
+        }
     }
-    
-    /**
-     * Get queue statistics
-     */
-    fun getQueueStats(): QueueStats {
-        return QueueStats(
-            totalRequests = totalRequests.get(),
-            completedRequests = completedRequests.get(),
-            failedRequests = failedRequests.get(),
-            pendingRequests = getQueueSize().toLong(),
-            isProcessing = isProcessing.get() == 1
-        )
+
+    private fun notifySafely(callback: () -> Unit) {
+        try {
+            callback()
+        } catch (e: Exception) {
+            Timber.tag("RequestQueue").e(e, "Queue callback failed")
+        }
     }
-    
-    /**
-     * Queue statistics
-     */
+
+    /** Non-blocking, observational only. Never receives from or sends to the queue. */
+    fun getQueueSize(): Int = pendingRequests.get()
+
+    fun getQueueStats() = QueueStats(
+        totalRequests = totalRequests.get(),
+        completedRequests = completedRequests.get(),
+        failedRequests = failedRequests.get(),
+        pendingRequests = getQueueSize().toLong(),
+        isProcessing = isProcessing.get()
+    )
+
     data class QueueStats(
         val totalRequests: Long,
         val completedRequests: Long,
@@ -210,28 +165,21 @@ class RequestQueueManager private constructor() {
         val isProcessing: Boolean
     ) {
         val successRate: Double
-            get() = if (totalRequests > 0) {
-                completedRequests.toDouble() / totalRequests.toDouble() * 100
-            } else 0.0
+            get() = if (totalRequests > 0) completedRequests.toDouble() / totalRequests * 100 else 0.0
     }
-    
-    /**
-     * Clear queue (for testing or emergency use only)
-     */
+
+    /** Resolve discarded waiters rather than leaving submitRequest suspended forever. */
     suspend fun clearQueue() {
         queueMutex.withLock {
-            while (!requestQueue.isEmpty) {
-                requestQueue.tryReceive()
+            while (true) {
+                val request = requestQueue.tryReceive().getOrNull() ?: break
+                request.cancel()
             }
-            Timber.tag("RequestQueue").w("Queue cleared")
         }
     }
-    
-    /**
-     * Shutdown queue manager
-     */
+
     fun shutdown() {
+        requestQueue.cancel()
         queueScope.cancel()
-        Timber.tag("RequestQueue").i("Request queue manager shutdown")
     }
 }
