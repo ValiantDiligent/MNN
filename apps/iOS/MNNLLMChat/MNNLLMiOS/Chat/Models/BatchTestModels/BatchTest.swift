@@ -33,6 +33,7 @@ enum BatchTestType: String, CaseIterable {
     case text = "text"
     case image = "image"
     case audio = "audio"
+    case tier9 = "tier9"
     
     var displayName: String {
         switch self {
@@ -42,6 +43,8 @@ enum BatchTestType: String, CaseIterable {
             return "Image Test"
         case .audio:
             return "Audio Test"
+        case .tier9:
+            return "Tier9 AL"
         }
     }
     
@@ -52,6 +55,8 @@ enum BatchTestType: String, CaseIterable {
         case .image:
             return "jsonl"
         case .audio:
+            return "jsonl"
+        case .tier9:
             return "jsonl"
         }
     }
@@ -64,6 +69,8 @@ enum BatchTestType: String, CaseIterable {
             return "Images"
         case .audio:
             return "Audios"
+        case .tier9:
+            return "Tier9"
         }
     }
 }
@@ -88,11 +95,14 @@ struct BatchTestResult {
     let item: BatchTestItem
     let response: String
     let timestamp: Date
+    /// Per-prompt timing collected by the engine; nil when unavailable
+    let metrics: [String: NSNumber]?
 
-    init(item: BatchTestItem, response: String, timestamp: Date) {
+    init(item: BatchTestItem, response: String, timestamp: Date, metrics: [String: NSNumber]? = nil) {
         self.item = item
         self.response = response
         self.timestamp = timestamp
+        self.metrics = metrics
     }
 }
 

@@ -1,0 +1,1 @@
+What is the sum of the digits in the terminating decimal representation of the fraction $\frac{4321}{5^7\cdot2^8}$?

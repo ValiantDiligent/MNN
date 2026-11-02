@@ -15,7 +15,7 @@ class ModelConfigManager {
     private let defaultBackendType = "cpu"
     private let defaultPrecision = "low"
     private let defaultThreadNum = 4
-    private let defaultMaxNewTokens = 128
+    private let defaultMaxNewTokens = 256
     private let maximumMaxNewTokens = 4096
     private let defaultTfsZ: Double = 1.0
     private let defaultTypical: Double = 1.0

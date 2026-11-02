@@ -846,6 +846,22 @@ final class LLMChatViewModel: ObservableObject, StreamingMessageProvider {
         }
     }
 
+    /// Retrieves batch responses together with per-prompt timing metrics.
+    /// - Parameters:
+    ///   - prompts: Prompts to run sequentially.
+    ///   - maxNewTokens: Generation cap for this batch.
+    ///   - completion: Responses and one metrics dictionary per prompt.
+    func getBatchLLMResponse(prompts: [String],
+                             maxNewTokens: Int,
+                             completion: @escaping ([String], [[String: NSNumber]]) -> Void) {
+        Task { [weak self] in
+            guard let self = self else { return }
+            await self.llmState.processBatchTestContent(prompts, llm: self.llm, maxNewTokens: maxNewTokens) { responses, metrics in
+                completion(responses, metrics)
+            }
+        }
+    }
+
     func setModelConfig() {
         if let configStr = modelConfigManager.readConfigAsJSONString(), let llm = llm {
             llm.setConfigWithJSONString(configStr)

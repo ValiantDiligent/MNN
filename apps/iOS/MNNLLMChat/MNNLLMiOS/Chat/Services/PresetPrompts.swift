@@ -110,7 +110,29 @@ enum PresetPrompts {
             text: codePrompt,
             imageBundlePath: nil
         ))
+        presets.append(contentsOf: tier9Presets())
         return presets
+    }
+
+    /// tier9: the nine on-device AL prompts, one chip each, so a normal chat turn
+    /// reproduces the file-bench case token for token.
+    private static let tier9Files: [(title: String, file: String)] = [
+        ("T9·he19", "humaneval_HumanEval_19.txt"),
+        ("T9·he131", "humaneval_HumanEval_131.txt"),
+        ("T9·he143", "humaneval_HumanEval_143.txt"),
+        ("T9·math164", "math500_math164.txt"),
+        ("T9·math209", "math500_math209.txt"),
+        ("T9·math223", "math500_math223.txt"),
+        ("T9·mt018", "mtbench_mt018.txt"),
+        ("T9·mt033", "mtbench_mt033.txt"),
+        ("T9·mt056", "mtbench_mt056.txt"),
+    ]
+
+    private static func tier9Presets() -> [PresetPrompt] {
+        tier9Files.compactMap { entry in
+            guard let text = loadText("tier9/\(entry.file)") else { return nil }
+            return PresetPrompt(title: entry.title, icon: "list.number", text: text, imageBundlePath: nil)
+        }
     }
 
     private static func identityAliases(for model: ModelInfo) -> [String] {

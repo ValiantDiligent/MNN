@@ -1,0 +1,1 @@
+Simplify $\tan 100^\circ + 4 \sin 100^\circ.$

@@ -43,6 +43,21 @@ class BatchFileTestService {
             
             lines.append("Prompt: \(result.item.prompt)")
 
+            if let metrics = result.metrics {
+                let prefill = metrics["prefill_tok_s"]?.doubleValue ?? 0
+                let decode = metrics["decode_tok_s"]?.doubleValue ?? 0
+                let promptTokens = metrics["prompt_tokens"]?.intValue ?? 0
+                let genTokens = metrics["gen_tokens"]?.intValue ?? 0
+                let steps = metrics["steps"]?.intValue ?? 0
+                let acceptLen = metrics["accept_len"]?.doubleValue ?? 0
+                lines.append(String(format: "Prefill: %d tokens, %.2f tokens/s", promptTokens, prefill))
+                lines.append(String(format: "Decode: %d tokens, %.2f tokens/s", genTokens, decode))
+                if steps > 0 {
+                    lines.append(String(format: "Spec: calls=%d, tokens/call=%.2f, AL<=%.2f (%@)",
+                                        steps, acceptLen + 1.0, acceptLen, acceptLen > 0.02 ? "active" : "inactive"))
+                }
+            }
+
             lines.append("Response: \(result.response)")
 
             lines.append("")
@@ -64,6 +79,10 @@ class BatchFileTestService {
 
             if configuration.includeTimestamp {
                 dict["timestamp"] = ISO8601DateFormatter().string(from: result.timestamp)
+            }
+
+            if let metrics = result.metrics {
+                dict["metrics"] = metrics
             }
 
             return dict
@@ -88,6 +107,10 @@ class BatchFileTestService {
 
             if configuration.includeTimestamp {
                 dict["timestamp"] = ISO8601DateFormatter().string(from: result.timestamp)
+            }
+
+            if let metrics = result.metrics {
+                dict["metrics"] = metrics
             }
 
             let jsonData = try JSONSerialization.data(withJSONObject: dict)

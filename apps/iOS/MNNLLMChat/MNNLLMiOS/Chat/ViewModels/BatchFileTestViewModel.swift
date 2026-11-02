@@ -19,6 +19,12 @@ class BatchFileTestViewModel: ObservableObject {
     
     /// Array of test results from batch execution
     @Published var testResults: [String] = []
+
+    /// Per-prompt timing reported by the engine, parallel to `testResults`
+    @Published var testMetrics: [[String: NSNumber]] = []
+
+    /// Generation cap used for the batch run
+    @Published var maxNewTokens: Int = 256
     
     /// Whether a batch test is currently running
     @Published var isTesting: Bool = false
@@ -77,6 +83,7 @@ class BatchFileTestViewModel: ObservableObject {
 
         isTesting = true
         testResults.removeAll()
+        testMetrics.removeAll()
 
         performBatchTest()
     }
@@ -182,6 +189,7 @@ class BatchFileTestViewModel: ObservableObject {
         isTesting = false
         testItems.removeAll()
         testResults.removeAll()
+        testMetrics.removeAll()
         shareFileURL = nil
         showingShareSheet = false
         pendingSharePresentation = false
@@ -258,12 +266,14 @@ class BatchFileTestViewModel: ObservableObject {
         // Extract prompts from test items
         let prompts = testItems.map { $0.prompt }
 
-        chatViewModel.getBatchLLMResponse(prompts: prompts) { [weak self] (responses: [String]) in
+        let tokens = max(1, min(4096, maxNewTokens))
+        chatViewModel.getBatchLLMResponse(prompts: prompts, maxNewTokens: tokens) { [weak self] (responses: [String], metrics: [[String: NSNumber]]) in
             Task { @MainActor in
                 guard let self = self else { return }
 
                 // Update results
                 self.testResults = responses
+                self.testMetrics = metrics
                 self.isTesting = false
             }
         }
@@ -279,7 +289,8 @@ class BatchFileTestViewModel: ObservableObject {
         let structuredResults: [BatchTestResult] = results.enumerated().map { index, output in
             let prompt = index < testItems.count ? testItems[index].prompt : ""
             let item = index < testItems.count ? testItems[index] : BatchTestItem(prompt: prompt, testType: .text)
-            return BatchTestResult(item: item, response: output, timestamp: Date())
+            let metrics = index < testMetrics.count ? testMetrics[index] : nil
+            return BatchTestResult(item: item, response: output, timestamp: Date(), metrics: metrics)
         }
 
         // Use default configuration and generate output

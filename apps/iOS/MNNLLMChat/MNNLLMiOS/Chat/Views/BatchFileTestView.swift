@@ -48,6 +48,9 @@ struct BatchFileTestView: View {
                 // Results Section
                 resultsSection
 
+                // Per-prompt speed readout
+                metricsSection
+
                 Spacer()
             }
             .padding()
@@ -81,6 +84,9 @@ struct BatchFileTestView: View {
                         },
                         .default(Text("Audio Test")) {
                             viewModel.loadLocalBatchTest(for: .audio)
+                        },
+                        .default(Text("Tier9 AL Test")) {
+                            viewModel.loadLocalBatchTest(for: .tier9)
                         },
                         .cancel(),
                     ]
@@ -193,6 +199,8 @@ struct BatchFileTestView: View {
             return .orange
         case .audio:
             return .green
+        case .tier9:
+            return .purple
         }
     }
 
@@ -212,6 +220,10 @@ struct BatchFileTestView: View {
                         .foregroundColor(.secondary)
                 }
             } else {
+                Stepper("Max new tokens: \(viewModel.maxNewTokens)",
+                        value: $viewModel.maxNewTokens, in: 32...2048, step: 32)
+                    .font(.caption)
+
                 HStack(spacing: 12) {
                     Button("Start Batch Test") {
                         viewModel.startBatchTest()
@@ -283,6 +295,63 @@ struct BatchFileTestView: View {
         .padding()
         .background(Color(.systemGray6))
         .cornerRadius(10)
+    }
+
+    /// Per-prompt prefill/decode speed reported by the engine
+    private var metricsSection: some View {
+        Group {
+            if !viewModel.testMetrics.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Speed")
+                        .font(.headline)
+
+                    if let average = averageDecodeTokensPerSecond {
+                        Text(String(format: "Avg decode: %.2f tok/s (max new %d)",
+                                    average, viewModel.maxNewTokens))
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 6) {
+                            ForEach(Array(viewModel.testMetrics.enumerated()), id: \.offset) { index, metrics in
+                                metricsRow(index: index, metrics: metrics)
+                            }
+                        }
+                    }
+                    .frame(maxHeight: 240)
+                }
+                .padding()
+                .background(Color(.systemGray6))
+                .cornerRadius(10)
+            }
+        }
+    }
+
+    private var averageDecodeTokensPerSecond: Double? {
+        let values = viewModel.testMetrics
+            .compactMap { $0["decode_tok_s"]?.doubleValue }
+            .filter { $0 > 0 }
+        guard !values.isEmpty else { return nil }
+        return values.reduce(0, +) / Double(values.count)
+    }
+
+    private func metricsRow(index: Int, metrics: [String: NSNumber]) -> some View {
+        let promptTokens = metrics["prompt_tokens"]?.intValue ?? 0
+        let genTokens = metrics["gen_tokens"]?.intValue ?? 0
+        let prefill = metrics["prefill_tok_s"]?.doubleValue ?? 0
+        let decode = metrics["decode_tok_s"]?.doubleValue ?? 0
+        return HStack(spacing: 8) {
+            Text("Item \(index + 1)")
+                .font(.caption)
+            Spacer()
+            Text(String(format: "P %d tok / %.1f tok/s", promptTokens, prefill))
+                .font(.caption)
+                .foregroundColor(.secondary)
+            Text(String(format: "D %d tok / %.2f tok/s", genTokens, decode))
+                .font(.caption)
+                .monospacedDigit()
+        }
     }
 
     // MARK: - Helper Methods

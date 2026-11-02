@@ -62,4 +62,26 @@ actor LLMState {
             completion(responses)
         }
     }
+
+    /// Processes a batch of prompts and reports per-prompt timing.
+    /// - Parameters:
+    ///   - prompts: Prompt strings, executed sequentially.
+    ///   - llm: Inference engine wrapper instance.
+    ///   - maxNewTokens: Generation cap applied for this batch only.
+    ///   - completion: Responses plus one metrics dictionary per prompt.
+    func processBatchTestContent(
+        _ prompts: [String],
+        llm: LLMInferenceEngineWrapper?,
+        maxNewTokens: Int,
+        completion: @escaping ([String], [[String: NSNumber]]) -> Void
+    ) {
+        guard let llm = llm else {
+            completion([], [])
+            return
+        }
+        llm.setMaxNewTokens(Int32(maxNewTokens))
+        llm.processBatchPrompts(prompts, showPerformance: true) { responses, metrics in
+            completion(responses, metrics)
+        }
+    }
 }
