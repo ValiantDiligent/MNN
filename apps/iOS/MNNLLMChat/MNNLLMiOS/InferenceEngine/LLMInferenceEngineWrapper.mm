@@ -608,6 +608,14 @@ static std::string ProcessLegacyVideoPlaceholders(const std::string& prompt, int
 - (MNN::Express::VARP)convertUIImageToVARP:(UIImage *)image;
 @end
 
+// DFlash clips each generate() call to the remaining budget and rolls the
+// accepted-but-unemitted tokens back, so a call that ends mid-block wastes up
+// to a full block of target verify. Four blocks amortises that while keeping
+// the user-visible stop latency at a few hundred ms.
+static int chatStepChunk(int blockSize) {
+    return blockSize > 1 ? blockSize * 4 : 1;
+}
+
 @implementation LLMInferenceEngineWrapper {
     std::shared_ptr<MNN::Transformer::Llm> _llm;
     std::vector<ChatMessage> _history;
@@ -622,6 +630,13 @@ static std::string ProcessLegacyVideoPlaceholders(const std::string& prompt, int
     NSString *_talkerSpeaker;
     BOOL (^_audioWaveformCallback)(const float *, size_t, BOOL);
     NSString *_modelPath;
+    // Load-time config echoed into every performance report so a slow run can
+    // be attributed to backend/threads/speculation without guessing.
+    NSString *_loadedBackend;
+    NSString *_loadedPrecision;
+    NSString *_speculativeType;
+    int _loadedThreads;
+    int _dflashBlockSize;
 }
 
 /**
@@ -868,6 +883,12 @@ bool removeDirectorySafely(const std::string& path) {
         BOOL useMmap = mergedConfig[@"use_mmap"] == nil ? YES : [mergedConfig[@"use_mmap"] boolValue];
         int configuredMaxNewTokens = mergedConfig[@"max_new_tokens"] ? [mergedConfig[@"max_new_tokens"] intValue] : 128;
         _maxNewTokens = std::max(1, std::min(4096, configuredMaxNewTokens));
+
+        _loadedBackend = [(mergedConfig[@"backend_type"] ?: @"cpu") copy];
+        _loadedPrecision = [(mergedConfig[@"precision"] ?: @"low") copy];
+        _speculativeType = [(mergedConfig[@"speculative_type"] ?: @"none") copy];
+        _loadedThreads = [mergedConfig[@"thread_num"] ?: @4 intValue];
+        _dflashBlockSize = [mergedConfig[@"dflash_block_size"] ?: @0 intValue];
         
         // Create LLM instance with error checking
         _llm.reset(MNN::Transformer::Llm::createLLM(config_path));
@@ -915,6 +936,17 @@ bool removeDirectorySafely(const std::string& path) {
               mergedConfig[@"precision"] ?: @"low",
               mergedConfig[@"thread_num"] ?: @4,
               useMmap ? @"true" : @"false");
+        // iOS suspends GPU work while the app is not active, so the first Metal
+        // command buffer submitted during load never completes and
+        // MetalBackend::onCopyBuffer blocks forever on its semaphore wait.
+        while (YES) {
+            __block UIApplicationState state;
+            dispatch_sync(dispatch_get_main_queue(), ^{
+                state = [UIApplication sharedApplication].applicationState;
+            });
+            if (state == UIApplicationStateActive) break;
+            [NSThread sleepForTimeInterval:0.05];
+        }
         _llm->load();
         
         NSLog(@"Model loaded successfully from path: %@", modelPath);
@@ -1124,6 +1156,10 @@ bool removeDirectorySafely(const std::string& path) {
                 // Reset stop flag before starting inference
                 blockSelf->_shouldStopInference = false;
                 
+                // response() below is decode step 0; every generate(1) is one
+                // more step. With DFlash one step commits several tokens, so
+                // tokens/steps-1 is the accept length measured on this device.
+                int generateSteps = 1;
                 // Execute inference with enhanced stopped status checking
                 @try {
                     // Debug information for prompt
@@ -1147,22 +1183,35 @@ bool removeDirectorySafely(const std::string& path) {
                     // The wrapper owns the sole UI completion event. An empty
                     // engine end marker still flushes on EOS without terminating
                     // the Swift stream before performance metrics are emitted.
-                    blockSelf->_llm->response(requestHistory, &os, "", 1);
+                    // One engine step commits a whole speculative block, so the
+                    // prefill call must be allowed to emit the block too: asking
+                    // for a single token makes DFlash pay for the block and
+                    // discard everything past slot 0 (AL pinned at 0, ~5x slower
+                    // than the same build benchmarked through the file-bench path).
+                    const char *chatStepEnv = getenv("MNN_CHAT_STEP");
+                    const int chatStep = chatStepEnv ? atoi(chatStepEnv) : 0;
+                    const int stepChunk = chatStep > 0 ? chatStep
+                        : chatStepChunk(blockSelf->_dflashBlockSize);
+                    blockSelf->_llm->response(requestHistory, &os, "", stepChunk);
                     
-                    int current_size = 1;
                     int max_new_tokens = blockSelf->_maxNewTokens;
+                    int current_size = context ? context->gen_seq_len : 1;
                     
-                    // Continue generation with precise token-by-token control
+                    // Continue generation chunk by chunk so a stop request is
+                    // honoured within a chunk instead of only at the end.
                     while (!blockSelf->_shouldStopInference.load() && 
                            !blockSelf->_llm->stoped() &&
                            current_size < max_new_tokens) {
                         
-                        // Generate single token for maximum control
-                        blockSelf->_llm->generate(1);
-                        current_size++;
-                        
-                        // Small delay to allow UI updates and stop signal processing
-                        // std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        const int want = MIN(stepChunk, max_new_tokens - current_size);
+                        const int before = context ? context->gen_seq_len : current_size;
+                        blockSelf->_llm->generate(want);
+                        const int emitted = (context ? context->gen_seq_len : current_size + want) - before;
+                        if (emitted <= 0) {
+                            break;
+                        }
+                        current_size += emitted;
+                        generateSteps++;
                     }
                     
                     if (!blockSelf->_shouldStopInference.load() && blockSelf->_enableAudioOutput.load()) {
@@ -1214,12 +1263,26 @@ bool removeDirectorySafely(const std::string& path) {
                     float decode_speed = (decode_s > 0.001f) ?
                         static_cast<float>(decode_len) / decode_s : 0.0f;
                     
-                    // Format performance results in 2-line format
+                    double tokensPerStep = generateSteps > 0 ? (double)decode_len / (double)generateSteps : 1.0;
+                    double acceptLen = tokensPerStep - 1.0;
+                    const bool specActive = acceptLen > 0.02;
+                    // Format performance results
                     std::ostringstream performance_output;
                     performance_output << "\n\nPrefill: " << std::fixed << std::setprecision(2) << prefill_s << "s, "
                                       << prompt_len << " tokens, " << std::setprecision(2) << prefill_speed << " tokens/s\n"
                                       << "Decode: " << std::fixed << std::setprecision(2) << decode_s << "s, "
-                                      << decode_len << " tokens, " << std::setprecision(2) << decode_speed << " tokens/s\n";
+                                      << decode_len << " tokens, " << std::setprecision(2) << decode_speed << " tokens/s\n"
+                                      << "Config: backend=" << [blockSelf->_loadedBackend UTF8String]
+                                      << ", precision=" << [blockSelf->_loadedPrecision UTF8String]
+                                      << ", threads=" << blockSelf->_loadedThreads << "\n"
+                                      << "Spec: " << [blockSelf->_speculativeType UTF8String]
+                                      << (blockSelf->_dflashBlockSize > 0 ? (" block=" + std::to_string(blockSelf->_dflashBlockSize)).c_str() : "")
+                                      << ", calls=" << generateSteps
+                                      << ", tokens/call=" << std::setprecision(2) << tokensPerStep
+                                      // One call may run several blocks, so this is an
+                                      // upper bound on the per-block AL the file bench reports.
+                                      << ", AL<=" << std::setprecision(2) << acceptLen
+                                      << (specActive ? " (spec active)" : " (spec inactive)") << "\n";
                     
                     // Output performance results on main queue
                     std::string perf_str = performance_output.str();
@@ -1466,20 +1529,33 @@ bool removeDirectorySafely(const std::string& path) {
             NSLog(@"[AudioWrapper] dump_config not available in this build (multimodal)");
 #endif
             NSLog(@"[AudioWrapper] Inference start (multimodal): enable_audio_output=%@, talker_speaker=%@", blockSelf->_enableAudioOutput.load() ? @"YES" : @"NO", blockSelf->_talkerSpeaker ?: @"(nil)");
+            // Same block-at-a-time budget as the text path: one token per call
+            // would throw away every speculative token the engine already verified.
+            const char *mmStepEnv = getenv("MNN_CHAT_STEP");
+            const int mmStep = mmStepEnv ? atoi(mmStepEnv) : 0;
+            const int stepChunk = mmStep > 0 ? mmStep : chatStepChunk(blockSelf->_dflashBlockSize);
             if (useMultimodal) {
-                blockSelf->_llm->response(multimodal_input, &os, "", 1);
+                blockSelf->_llm->response(multimodal_input, &os, "", stepChunk);
             } else {
-                blockSelf->_llm->response(requestHistory, &os, "", 1);
+                blockSelf->_llm->response(requestHistory, &os, "", stepChunk);
             }
             
-            int current_size = 1;
+            int current_size = context ? context->gen_seq_len : 1;
             const int max_new_tokens = blockSelf->_maxNewTokens;
+            int generateSteps = 1;
             
             while (!blockSelf->_shouldStopInference.load() &&
                    !blockSelf->_llm->stoped() &&
                    current_size < max_new_tokens) {
-                blockSelf->_llm->generate(1);
-                current_size++;
+                const int want = MIN(stepChunk, max_new_tokens - current_size);
+                const int before = context ? context->gen_seq_len : current_size;
+                blockSelf->_llm->generate(want);
+                const int emitted = (context ? context->gen_seq_len : current_size + want) - before;
+                if (emitted <= 0) {
+                    break;
+                }
+                current_size += emitted;
+                generateSteps++;
             }
             
             if (!blockSelf->_shouldStopInference.load() && blockSelf->_enableAudioOutput.load()) {
@@ -1514,11 +1590,22 @@ bool removeDirectorySafely(const std::string& path) {
                 float decode_speed = (decode_s > 0.001f) ?
                     static_cast<float>(decode_len) / decode_s : 0.0f;
                 
+                double tokensPerStep = generateSteps > 0 ? (double)decode_len / (double)generateSteps : 1.0;
+                double acceptLen = tokensPerStep - 1.0;
                 std::ostringstream performance_output;
                 performance_output << "\n\nPrefill: " << std::fixed << std::setprecision(2) << prefill_s << "s, "
                                    << prompt_len << " tokens, " << std::setprecision(2) << prefill_speed << " tokens/s\n"
                                    << "Decode: " << std::fixed << std::setprecision(2) << decode_s << "s, "
-                                   << decode_len << " tokens, " << std::setprecision(2) << decode_speed << " tokens/s\n";
+                                   << decode_len << " tokens, " << std::setprecision(2) << decode_speed << " tokens/s\n"
+                                   << "Config: backend=" << [blockSelf->_loadedBackend UTF8String]
+                                   << ", precision=" << [blockSelf->_loadedPrecision UTF8String]
+                                   << ", threads=" << blockSelf->_loadedThreads << "\n"
+                                   << "Spec: " << [blockSelf->_speculativeType UTF8String]
+                                   << (blockSelf->_dflashBlockSize > 0 ? (" block=" + std::to_string(blockSelf->_dflashBlockSize)).c_str() : "")
+                                   << ", calls=" << generateSteps
+                                   << ", tokens/call=" << std::setprecision(2) << tokensPerStep
+                                   << ", AL<=" << std::setprecision(2) << acceptLen
+                                   << (acceptLen > 0.02 ? " (spec active)" : " (spec inactive)") << "\n";
                 
                 std::string perf_str = performance_output.str();
                 NSLog(@"Multimodal LLM performance:%s", perf_str.c_str());
@@ -2459,18 +2546,21 @@ bool removeDirectorySafely(const std::string& path) {
  */
 - (void)processBatchPrompts:(NSArray<NSString *> *)prompts
                  completion:(void (^)(NSArray<NSString *> *responses))completion {
-    if (!_llm) {
+    [self processBatchPrompts:prompts showPerformance:NO completion:^(NSArray<NSString *> *responses, NSArray<NSDictionary<NSString *, NSNumber *> *> *metrics) {
         if (completion) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                completion(@[]);
-            });
+            completion(responses);
         }
-        return;
-    }
-    if (!prompts || prompts.count == 0) {
+    }];
+}
+
+- (void)processBatchPrompts:(NSArray<NSString *> *)prompts
+            showPerformance:(BOOL)showPerformance
+                 completion:(void (^)(NSArray<NSString *> *responses,
+                                      NSArray<NSDictionary<NSString *, NSNumber *> *> *metrics))completion {
+    if (!_llm || !prompts || prompts.count == 0) {
         if (completion) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                completion(@[]);
+                completion(@[], @[]);
             });
         }
         return;
@@ -2480,7 +2570,7 @@ bool removeDirectorySafely(const std::string& path) {
     if (_isProcessing.load()) {
         if (completion) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                completion(@[]);
+                completion(@[], @[]);
             });
         }
         return;
@@ -2490,10 +2580,16 @@ bool removeDirectorySafely(const std::string& path) {
 
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
         NSMutableArray<NSString *> *results = [[NSMutableArray alloc] initWithCapacity:prompts.count];
+        NSMutableArray<NSDictionary<NSString *, NSNumber *> *> *allMetrics = [[NSMutableArray alloc] initWithCapacity:prompts.count];
         @try {
+            // Fresh KV state and timers for the first prompt
+            self->_llm->reset();
+
+            int lastGenerateSteps = 1;
             for (NSString *prompt in prompts) {
                 if (!prompt || prompt.length == 0) {
                     [results addObject:@""]; // Keep position
+                    [allMetrics addObject:@{}];
                     continue;
                 }
 
@@ -2519,17 +2615,73 @@ bool removeDirectorySafely(const std::string& path) {
 
                 // Perform response generation similar to streaming method but without UI callbacks
                 @try {
-                    self->_llm->response(self->_history, &os, "<eop>", 1);
-
-                    int current_size = 1;
+                    // DFlash: the 4th arg of response() is max_new_tokens, not block
+                    // size. Slicing it to _dflashBlockSize forces every call to stop
+                    // at 16 tokens, so tokens/call degenerates to the chunk size.
+                    // Default to one full-length call (bench semantics); MNN_BATCH_STEP
+                    // restores the old sliced behaviour for A/B comparison.
+                    auto *batchContext = self->_llm->getContext();
                     const int max_new_tokens = self->_maxNewTokens;
-                    while (!self->_shouldStopInference.load() && !self->_llm->stoped() && current_size < max_new_tokens) {
-                        self->_llm->generate(1);
-                        current_size++;
+                    const char *stepEnv = getenv("MNN_BATCH_STEP");
+                    const int envStep = stepEnv ? atoi(stepEnv) : 0;
+                    const int stepChunk = envStep > 0 ? envStep : (self->_dflashBlockSize > 1 ? self->_dflashBlockSize : 1);
+                    if (envStep > 0) {
+                        int generateSteps = 1;
+                        self->_llm->response(self->_history, &os, "<eop>", stepChunk);
+                        int current_size = batchContext ? batchContext->gen_seq_len : 1;
+                        while (!self->_shouldStopInference.load() && !self->_llm->stoped() && current_size < max_new_tokens) {
+                            const int want = MIN(stepChunk, max_new_tokens - current_size);
+                            const int before = batchContext ? batchContext->gen_seq_len : current_size;
+                            self->_llm->generate(want);
+                            const int emitted = (batchContext ? batchContext->gen_seq_len : current_size + want) - before;
+                            if (emitted <= 0) {
+                                break;
+                            }
+                            current_size += emitted;
+                            generateSteps++;
+                        }
+                        lastGenerateSteps = generateSteps;
+                    } else {
+                        self->_llm->response(self->_history, &os, "<eop>", max_new_tokens);
+                        // Engine does not expose spl_count; step count unknown.
+                        lastGenerateSteps = 0;
                     }
                 } @catch (NSException *e) {
                     NSLog(@"Exception during batch response generation: %@", e.reason);
                 }
+
+                NSDictionary<NSString *, NSNumber *> *metrics = @{};
+                if (showPerformance) {
+                    auto *context = self->_llm->getContext();
+                    if (context) {
+                        int prompt_len = context->prompt_len;
+                        int gen_len = context->gen_seq_len;
+                        int64_t prefill_us = context->prefill_us;
+                        int64_t decode_us = context->decode_us;
+                        double prefill_s = static_cast<double>(prefill_us) / 1e6;
+                        double decode_s = static_cast<double>(decode_us) / 1e6;
+                        double prefill_tps = prefill_s > 0.001 ? static_cast<double>(prompt_len) / prefill_s : 0.0;
+                        double decode_tps = decode_s > 0.001 ? static_cast<double>(gen_len) / decode_s : 0.0;
+                        // steps == 0 means a single full-length call; the engine keeps
+                        // spl_count private, so AL cannot be derived from this path.
+                        double tokens_per_step = lastGenerateSteps > 0 ? static_cast<double>(gen_len) / static_cast<double>(lastGenerateSteps) : 0.0;
+                        double accept_len = lastGenerateSteps > 0 ? tokens_per_step - 1.0 : 0.0;
+                        metrics = @{
+                            @"prompt_tokens": @(prompt_len),
+                            @"gen_tokens": @(gen_len),
+                            @"steps": @(lastGenerateSteps),
+                            @"tokens_per_step": @(tokens_per_step),
+                            @"accept_len": @(accept_len),
+                            @"prefill_us": @(static_cast<long long>(prefill_us)),
+                            @"decode_us": @(static_cast<long long>(decode_us)),
+                            @"prefill_tok_s": @(prefill_tps),
+                            @"decode_tok_s": @(decode_tps),
+                        };
+                        NSLog(@"Batch prompt %lu: %d tok prefill %.2f tok/s, %d tok decode %.2f tok/s, %d calls, tokens/call %.2f (AL upper bound)",
+                              (unsigned long)results.count, prompt_len, prefill_tps, gen_len, decode_tps, lastGenerateSteps, tokens_per_step);
+                    }
+                }
+                [allMetrics addObject:metrics];
 
                 // Convert accumulated C++ string to NSString
                 NSString *nsOut = [NSString stringWithUTF8String:accumulator.c_str()];
@@ -2542,11 +2694,12 @@ bool removeDirectorySafely(const std::string& path) {
                 }
                 [results addObject:nsOut];
 
-                // Reset context/history between prompts
+                // Reset context/history between prompts so each prompt starts cold
                 {
                     std::lock_guard<std::mutex> lock(self->_historyMutex);
                     self->_history.clear();
                 }
+                self->_llm->reset();
             }
         } @catch (NSException *exception) {
             NSLog(@"Batch processing exception: %@", exception.reason);
@@ -2555,11 +2708,15 @@ bool removeDirectorySafely(const std::string& path) {
             self->_isProcessing = false;
             if (completion) {
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    completion([results copy]);
+                    completion([results copy], [allMetrics copy]);
                 });
             }
         }
     });
+}
+
+- (void)setMaxNewTokens:(int)maxNewTokens {
+    _maxNewTokens = std::max(1, std::min(4096, maxNewTokens));
 }
 
 @end

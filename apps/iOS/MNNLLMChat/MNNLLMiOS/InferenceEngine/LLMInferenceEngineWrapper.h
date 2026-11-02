@@ -253,6 +253,27 @@ typedef void (^BenchmarkCompleteCallback)(BenchmarkResult *result);
 - (void)processBatchPrompts:(NSArray<NSString *> *)prompts
                  completion:(void (^)(NSArray<NSString *> *responses))completion;
 
+/**
+ * Process multiple prompts and report per-prompt timing.
+ *
+ * Each metrics dictionary contains, for the matching prompt index:
+ * prompt_tokens, gen_tokens, prefill_us, decode_us, prefill_tok_s, decode_tok_s.
+ * Dictionary is empty for prompts that failed to run.
+ *
+ * @param showPerformance When NO, the metrics array contains empty dictionaries
+ * @param completion Called on the main thread with responses and metrics
+ */
+- (void)processBatchPrompts:(NSArray<NSString *> *)prompts
+            showPerformance:(BOOL)showPerformance
+                 completion:(void (^)(NSArray<NSString *> *responses,
+                                      NSArray<NSDictionary<NSString *, NSNumber *> *> *metrics))completion;
+
+/**
+ * Overrides the generation cap for subsequent responses (1...4096).
+ * The value from the loaded config is replaced until the next setConfig call.
+ */
+- (void)setMaxNewTokens:(int)maxNewTokens;
+
 @end
 
 NS_ASSUME_NONNULL_END
