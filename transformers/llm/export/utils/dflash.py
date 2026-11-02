@@ -134,12 +134,12 @@ class DFlash(torch.nn.Module):
         self.dflash_config = config_dict
         self.model_type = base.config.model_type
 
-        # Base model config
+        # Only hidden_size is shared with the target; the draft has its own head geometry
         self.hidden_size = base.config.hidden_size
-        self.head_dim = base.config.head_dim
-        self.num_attention_heads = base.config.num_attention_heads
-        self.num_key_value_heads = base.config.num_key_value_heads
-        self.rms_norm_eps = getattr(base.config, 'rms_norm_eps', 1e-6)
+        self.head_dim = config_dict.get('head_dim', base.config.head_dim)
+        self.num_attention_heads = config_dict.get('num_attention_heads', base.config.num_attention_heads)
+        self.num_key_value_heads = config_dict.get('num_key_value_heads', base.config.num_key_value_heads)
+        self.rms_norm_eps = config_dict.get('rms_norm_eps', getattr(base.config, 'rms_norm_eps', 1e-6))
 
         # DFlash-specific config
         dflash_cfg = config_dict.get('dflash_config', {})
@@ -200,9 +200,11 @@ class DFlash(torch.nn.Module):
         # Shared embed_tokens from base model (for embedding block tokens)
         self.embed_tokens = base.embed.embed
 
-        # Rotary embedding
+        # Rotary embedding: the draft's own theta wins over the target's
         # Compatibility: transformers>=5.x moved rope_theta into rope_parameters dict
-        self.rope_theta = getattr(base.config, 'rope_theta', None)
+        self.rope_theta = config_dict.get('rope_theta', None)
+        if self.rope_theta is None:
+            self.rope_theta = getattr(base.config, 'rope_theta', None)
         if self.rope_theta is None or self.rope_theta == 10000.0:
             origin_cfg = getattr(base.config, 'origin_config', base.config)
             rp = getattr(origin_cfg, 'rope_parameters', None) or getattr(origin_cfg, 'rope_scaling', None)

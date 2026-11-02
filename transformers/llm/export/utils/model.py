@@ -420,7 +420,9 @@ class LlmModel(PreTrainedModel):
 
             # dflash: collect hidden states AFTER the layer (output of layer)
             if i in dflash_layer_ids:
-                spec_hidden_states.append(hidden_states)
+                # explicit view pins rank 3 in the traced IR, which ONNX cat requires
+                _b, _s, _h = hidden_states.shape[0], hidden_states.shape[1], hidden_states.shape[-1]
+                spec_hidden_states.append(hidden_states.contiguous().view(_b, _s, _h))
 
         talker_embeds = None
         if hasattr(self, 'talker') and self.talker is not None:
